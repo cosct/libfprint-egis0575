@@ -1805,8 +1805,10 @@ on_frame_accepted_enroll (FpDevice *dev,
           /* No FP_DEVICE_RETRY_* code means "move to a different spot";
            * GENERAL ("poor scan quality / general scanning problem") is the
            * honest fit — CENTER_FINGER would tell the user to center a
-           * finger that is already well placed. */
-          fpi_device_enroll_progress (dev, self->enroll_stage, enroll_print,
+           * finger that is already well placed. Per the API contract the
+           * print argument is NULL on failure (fprintd warns "Driver passed
+           * an error and also provided a print" otherwise). */
+          fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
                                       fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
 
           self->capture_armed = FALSE;

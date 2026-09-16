@@ -31,6 +31,9 @@
  * - Windows-engine matcher port (11-orientation ridge matched-filter bank,
  *   512-bit descriptors, Hamming/RANSAC scoring — egis0575-matcher.c);
  *   full-width 103-column frames (EH575 has no dead columns)
+ * - fast 120 ms poll cadence for 15 s after action start / finger events, and
+ *   verify-time template feedback (taught frames cached per print for the
+ *   fprintd process lifetime)
  * - EGIS0575_ACTIVE_WIDTH / EGIS0575_SKIP_CALIBRATION env knobs kept for
  *   A/B experiments
  */
@@ -93,6 +96,7 @@ struct _FpDeviceEgis0575
   gboolean      has_pre_init_run;
 
   guint8       *calibration;       /* 5356-byte block; survives close as upload cache (watchdog/broken-check/dispose drop it) */
+  guint         cal_read_recoveries; /* bounded reset+re-read attempts after a broken calibration read */
   gint64        last_finger_activity_ms; /* anchor for the deep-idle cadence */
   gboolean      cal_skip;          /* EGIS0575_SKIP_CALIBRATION=1: EH577-style, no cal */
   const Packet *cal_pkt_array;     /* child-SSM packet array being run */
@@ -111,11 +115,17 @@ struct _FpDeviceEgis0575
   GPtrArray    *verify_probes;     /* Egis0575MFeatureSet* per collected probe */
   Egis0575MFeatureSet *verify_gallery;  /* unpacked enrolled feature frames */
   guint         verify_gallery_n;
+  guint8       *embedded_cal;      /* v2 template's calibration block: fallback when the sensor read is broken */
+  gboolean      cal_recovery_adopted; /* adopted embedded cal this action; first structured frame disproves or clears it */
 
   Egis0575MFeatureSet *enroll_feats;    /* heap: 12 sets exceed the GObject instance limit */
   guint         enroll_stage;
   gint          enroll_sim_threshold;  /* same-spot reject gate; 0 disables */
   guint         enroll_sim_rejects;    /* consecutive same-spot rejects */
+
+  guint         finger_settle_ms;     /* per-touch settle window (EGIS0575_FINGER_SETTLE_MS) */
+  gboolean      verify_feedback;      /* EGIS0575_VERIFY_FEEDBACK=0 disables */
+  GPtrArray    *feedback_cache;       /* Egis0575FeedbackEntry*, survives close like the calibration cache */
 
   guint         startup_timeout_retries;
   guint         timeout_recoveries;   /* consecutive timeout restarts; any successful
@@ -192,7 +202,18 @@ G_DEFINE_TYPE (FpDeviceEgis0575, fpi_device_egis0575, FP_TYPE_DEVICE);
  * ≤500 ms press latency), further easing long fprintd sessions (the
  * Windows driver goes fully silent between auth windows, protocol.md §7 —
  * fprintd's finger-status semantics forbid that, so this is the closest
- * portable approximation). */
+ * portable approximation).
+ *
+ * While a verify/enroll action is live the cadence rises to
+ * ACTIVE_FRAME_DELAY_MS: the finger typically lands within seconds of the
+ * prompt, and the desensitization concern targets hour-long idle polling,
+ * not a short auth window. The fast tier is time-boxed to
+ * ACTIVE_FAST_WINDOW_MS after the action start / the last finger event
+ * (last_finger_activity_ms is re-armed by both): a lockscreen left waiting
+ * for minutes falls back to the idle tiers instead of sustaining the
+ * elevated bus load. */
+#define EGIS0575_ACTIVE_FRAME_DELAY_MS 120
+#define EGIS0575_ACTIVE_FAST_WINDOW_MS 15000
 #define EGIS0575_IDLE_FRAME_DELAY_MS 230
 #define EGIS0575_IDLE_FRAME_DELAY_DEEP_MS 500
 #define EGIS0575_IDLE_DEEP_AFTER_MS 30000
@@ -204,9 +225,14 @@ G_DEFINE_TYPE (FpDeviceEgis0575, fpi_device_egis0575, FP_TYPE_DEVICE);
  *  - prophylactic: full re-init (incl. the 97 00 00 sensor reset inside
  *    the calibration chain) after this much continuous uptime;
  *  - reactive: this many weak-press frames inside the window means the
- *    sensor hears presses but cannot see them -> recover now. */
+ *    sensor hears presses but cannot see them -> recover now. Tuned
+ *    2026-09-16: at 20 the detector only caught a held-down finger on a
+ *    fully deaf sensor; the observed post-session pattern is intermittent
+ *    re-presses reading 1-16% coverage for ~20 s (verify-2 of the
+ *    2026-09-16 5/5 run accumulated 15 weak frames and never triggered),
+ *    so the bar drops to 8 — still above a couple of genuine light taps. */
 #define EGIS0575_IDLE_REINIT_MS 600000
-#define EGIS0575_WEAK_PRESS_EVENTS 20
+#define EGIS0575_WEAK_PRESS_EVENTS 8
 #define EGIS0575_WEAK_PRESS_WINDOW_MS 8000
 
 /* Startup: recycle the interface claim up to this many times if the first
@@ -285,11 +311,14 @@ sensor_health_watchdog (FpDeviceEgis0575 *self, FpiUsbTransfer *transfer, FpiSsm
   return TRUE;
 }
 
-/* Per-touch timing. After a finger first lands we ignore frames for SETTLE_MS
- * so the press stabilises before evaluation. If no valid frame is captured
- * within TURN_TIMEOUT_MS the turn fails and the driver waits for a real lift
- * before arming a new attempt. */
-#define EGIS0575_FINGER_SETTLE_MS                  400
+/* Per-touch timing. After a finger first lands we ignore frames for
+ * finger_settle_ms so the press stabilises before evaluation; the Stage-2
+ * quality gate rejects unstable frames anyway, so a short settle mainly
+ * saves claim budget and CPU. If no valid frame is captured within
+ * TURN_TIMEOUT_MS the turn fails and the driver waits for a real lift
+ * before arming a new attempt. EGIS0575_FINGER_SETTLE_MS overrides the
+ * settle for A/B experiments. */
+#define EGIS0575_FINGER_SETTLE_MS_DEFAULT         250
 #define EGIS0575_TURN_TIMEOUT_MS                  1400
 
 /* Startup: grab this many valid (non-zero) idle frames as the warm background
@@ -314,6 +343,19 @@ sensor_health_watchdog (FpDeviceEgis0575 *self, FpiUsbTransfer *transfer, FpiSsm
 /* Bounded retries for the calibration status polls (60 2d / 60 35 / 60 00);
  * topni1 polled unbounded, but a wedged sensor must fail cleanly. */
 #define EGIS0575_CAL_POLL_MAX_ITERS                500
+
+/* Bounded recovery for a broken calibration read (uniform-tail block).
+ * Observed 2026-09-14/15: after a capture session the read returns all-zero
+ * blocks — the firmware invalidates its calibration RAM and regenerates it
+ * in the background over seconds-to-minutes (in-chain 97 resets do not
+ * speed it up; a USB port reset wedges the chain's polls for minutes, so
+ * waiting is the only reliable heal). Recovery therefore: one immediate
+ * re-read for transient corruption, adoption of the verify template's
+ * embedded calibration block (v2 prints — the Windows host-side cache
+ * carried through fprintd storage), then patient 1 Hz re-reads until the
+ * firmware rebuild finishes. Past the cap the action fails cleanly. */
+#define EGIS0575_CAL_READ_MAX_RECOVERIES           7
+#define EGIS0575_CAL_REREAD_DELAY_MS            1000
 
 static const char *
 packet_array_name (const Packet *pkt_array)
@@ -340,11 +382,18 @@ packet_array_name (const Packet *pkt_array)
   return "unknown";
 }
 
-/* Idle poll cadence: fast after finger activity, deep after a quiet spell. */
+/* Idle poll cadence: fastest while a client action waits for the finger,
+ * fast after finger activity, deep after a quiet spell. */
 static guint
-idle_frame_delay_ms (FpDeviceEgis0575 *self)
+idle_frame_delay_ms (FpDeviceEgis0575 *self, FpDevice *dev)
 {
+  FpiDeviceAction action = fpi_device_get_current_action (dev);
   gint64 now_ms = g_get_monotonic_time () / 1000;
+
+  if ((action == FPI_DEVICE_ACTION_VERIFY || action == FPI_DEVICE_ACTION_ENROLL) &&
+      self->last_finger_activity_ms != 0 &&
+      now_ms - self->last_finger_activity_ms < EGIS0575_ACTIVE_FAST_WINDOW_MS)
+    return EGIS0575_ACTIVE_FRAME_DELAY_MS;
 
   if (self->last_finger_activity_ms != 0 &&
       now_ms - self->last_finger_activity_ms >= EGIS0575_IDLE_DEEP_AFTER_MS)
@@ -374,16 +423,26 @@ report_finger_status (FpDeviceEgis0575 *self,
                                            present ? FP_FINGER_STATUS_NONE : FP_FINGER_STATUS_PRESENT);
 }
 
-/* Feature-template serialization, version 1: (y aa(qqyay)) — a version byte
- * plus frames of features (x, y, orientation index, 64-byte descriptor).
+/* Feature-template serialization:
+ *   version 1: (y aa(qqyay)) — a version byte plus frames of features
+ *              (x, y, orientation index, 64-byte descriptor);
+ *   version 2: (y aa(qqyay) ay) — additionally embeds the 5356-byte
+ *              calibration block captured at enroll time. The block is the
+ *              Windows host-side cache carried through fprintd's print
+ *              storage (Windows persists it in the registry and uploads it
+ *              every session, protocol.md §4C): when the sensor-side
+ *              calibration read is invalidated (post-session all-zero
+ *              block, §8 #3) the embedded copy is uploaded instead.
  *
  * The v0.2.0 driver wrote aa(qqay) and silently dropped the orientation
  * index even though scoring depends on it; prints stored in that format
- * cannot match after a reload and are rejected on unpack (re-enroll). */
-#define EGIS0575_TEMPLATE_VERSION 1
+ * cannot match after a reload and are rejected on unpack (re-enroll).
+ * v1 prints remain valid but lack the embedded calibration fallback. */
+#define EGIS0575_TEMPLATE_VERSION 2
 
 static GVariant *
-pack_feature_frames (const Egis0575MFeatureSet *sets, guint n_sets)
+pack_feature_frames (const Egis0575MFeatureSet *sets, guint n_sets,
+                     const guint8 *calibration)
 {
   GVariantBuilder outer;
 
@@ -405,20 +464,28 @@ pack_feature_frames (const Egis0575MFeatureSet *sets, guint n_sets)
       g_variant_builder_close (&outer);
     }
 
-  return g_variant_new ("(y@aa(qqyay))",
+  return g_variant_new ("(y@aa(qqyay)@ay)",
                         (guint8) EGIS0575_TEMPLATE_VERSION,
-                        g_variant_builder_end (&outer));
+                        g_variant_builder_end (&outer),
+                        g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
+                                                   calibration,
+                                                   calibration ? EGIS0575_IMGSIZE : 0,
+                                                   1));
 }
 
 static gboolean
 unpack_feature_frames (GVariant             *data,
                        Egis0575MFeatureSet **out_sets,
-                       guint                *out_n)
+                       guint                *out_n,
+                       guint8              **out_cal)
 {
   Egis0575MFeatureSet *sets;
   GVariant *frames;
   guint8 version;
   guint n_frames, fi;
+
+  if (out_cal)
+    *out_cal = NULL;
 
   if (g_variant_is_of_type (data, G_VARIANT_TYPE ("aa(qqay)")))
     {
@@ -427,16 +494,44 @@ unpack_feature_frames (GVariant             *data,
       return FALSE;
     }
 
-  if (!g_variant_is_of_type (data, G_VARIANT_TYPE ("(yaa(qqyay))")))
-    return FALSE;
-
-  g_variant_get (data, "(y@aa(qqyay))", &version, &frames);
-  if (version != EGIS0575_TEMPLATE_VERSION)
+  if (g_variant_is_of_type (data, G_VARIANT_TYPE ("(yaa(qqyay))")))
     {
-      fp_warn ("Enrolled print has unsupported template version %u", version);
-      g_variant_unref (frames);
-      return FALSE;
+      g_variant_get (data, "(y@aa(qqyay))", &version, &frames);
+      if (version != 1)
+        {
+          fp_warn ("Enrolled print has unsupported template version %u", version);
+          g_variant_unref (frames);
+          return FALSE;
+        }
     }
+  else if (g_variant_is_of_type (data, G_VARIANT_TYPE ("(yaa(qqyay)ay)")))
+    {
+      GVariant *cal;
+      gsize cal_len = 0;
+      gconstpointer cal_data;
+
+      g_variant_get (data, "(y@aa(qqyay)@ay)", &version, &frames, &cal);
+      if (version != 2)
+        {
+          fp_warn ("Enrolled print has unsupported template version %u", version);
+          g_variant_unref (frames);
+          g_variant_unref (cal);
+          return FALSE;
+        }
+      cal_data = g_variant_get_fixed_array (cal, &cal_len, 1);
+      if (cal_len != 0 && cal_len != EGIS0575_IMGSIZE)
+        {
+          fp_warn ("Enrolled print embeds a %zu-byte calibration block (expected %d); ignoring it",
+                   cal_len, EGIS0575_IMGSIZE);
+        }
+      else if (out_cal && cal_len == EGIS0575_IMGSIZE)
+        {
+          *out_cal = g_memdup2 (cal_data, EGIS0575_IMGSIZE);
+        }
+      g_variant_unref (cal);
+    }
+  else
+    return FALSE;
 
   n_frames = (guint) g_variant_n_children (frames);
   if (n_frames == 0 || n_frames > 64)
@@ -513,6 +608,144 @@ probe_matches_gallery (const Egis0575MFeatureSet *probe,
   return best >= EGIS0575_M_MATCH_THRESHOLD && agree >= EGIS0575_M_AGREE_FRAMES;
 }
 
+/* Verify-time template feedback (in-memory analogue of the Windows engine's
+ * 'AE' registry blob, which updates the template after successful verifies):
+ * a probe that matched with margin joins the gallery, so the template adapts
+ * to unlock-time finger placement and slow drift instead of staying frozen at
+ * enrollment. fprintd never re-stores prints after enroll, so the adapted
+ * gallery lives in this cache keyed by the enrolled template's serialized
+ * bytes; like the calibration cache it lasts for the fprintd process
+ * lifetime (a resident fprintd, e.g. systemd drop-in `ExecStart=/usr/lib/fprintd -t`,
+ * keeps it across unlock sessions).
+ *
+ * Safety rails: only probes clearing MATCH_THRESHOLD + MARGIN teach (an
+ * impostor must first false-accept by 30 points above the calibrated
+ * margin-47 threshold before it could pollute anything); same-placement
+ * probes (>= the enroll HIGHLY_SIMILARITY gate against any pooled frame)
+ * carry no new information and are skipped; the gallery cap bounds the
+ * FAR lottery-ticket growth to 4 extra frames. */
+#define EGIS0575_VERIFY_FEEDBACK_MIN_MARGIN 30
+#define EGIS0575_VERIFY_FEEDBACK_MAX_FRAMES 16  /* 12 enrolled + up to 4 taught */
+#define EGIS0575_VERIFY_FEEDBACK_MAX_PRINTS 4   /* cached galleries (one per enrolled finger) */
+
+typedef struct
+{
+  GBytes              *enrolled_id;  /* serialized enrolled fpi-data: print identity */
+  Egis0575MFeatureSet *frames;       /* enrolled frames first, then taught frames */
+  guint                n_enrolled;   /* frames[0..n_enrolled) are never evicted */
+  guint                n_frames;
+  gint64               last_used;    /* LRU anchor for the per-print cache */
+} Egis0575FeedbackEntry;
+
+static void
+feedback_entry_free (gpointer data)
+{
+  Egis0575FeedbackEntry *entry = data;
+
+  g_bytes_unref (entry->enrolled_id);
+  g_free (entry->frames);
+  g_free (entry);
+}
+
+static Egis0575FeedbackEntry *
+feedback_cache_lookup (FpDeviceEgis0575 *self, GBytes *enrolled_id)
+{
+  if (!self->feedback_cache)
+    return NULL;
+
+  for (guint i = 0; i < self->feedback_cache->len; i++)
+    {
+      Egis0575FeedbackEntry *entry = g_ptr_array_index (self->feedback_cache, i);
+
+      if (g_bytes_equal (entry->enrolled_id, enrolled_id))
+        {
+          entry->last_used = g_get_monotonic_time ();
+          return entry;
+        }
+    }
+  return NULL;
+}
+
+/* Cache a copy of the freshly unpacked enrolled gallery so later verifies of
+ * the same print can pick up taught frames. Evicts the least-recently-used
+ * print's gallery past EGIS0575_VERIFY_FEEDBACK_MAX_PRINTS. */
+static Egis0575FeedbackEntry *
+feedback_cache_store (FpDeviceEgis0575 *self, GBytes *enrolled_id,
+                      const Egis0575MFeatureSet *gallery, guint gallery_n)
+{
+  Egis0575FeedbackEntry *entry;
+
+  if (!self->feedback_cache)
+    self->feedback_cache = g_ptr_array_new_with_free_func (feedback_entry_free);
+
+  if (self->feedback_cache->len >= EGIS0575_VERIFY_FEEDBACK_MAX_PRINTS)
+    {
+      guint oldest = 0;
+
+      for (guint i = 1; i < self->feedback_cache->len; i++)
+        {
+          Egis0575FeedbackEntry *e = g_ptr_array_index (self->feedback_cache, i);
+
+          if (e->last_used < ((Egis0575FeedbackEntry *) g_ptr_array_index (self->feedback_cache, oldest))->last_used)
+            oldest = i;
+        }
+      g_ptr_array_remove_index (self->feedback_cache, oldest);
+    }
+
+  entry = g_new0 (Egis0575FeedbackEntry, 1);
+  entry->enrolled_id = g_bytes_ref (enrolled_id);
+  /* Allocate with headroom for taught frames so feedback_teach can append. */
+  entry->frames = g_malloc (MAX (gallery_n, EGIS0575_VERIFY_FEEDBACK_MAX_FRAMES) *
+                            sizeof (Egis0575MFeatureSet));
+  memcpy (entry->frames, gallery, gallery_n * sizeof (Egis0575MFeatureSet));
+  entry->n_enrolled = gallery_n;
+  entry->n_frames = gallery_n;
+  entry->last_used = g_get_monotonic_time ();
+  g_ptr_array_add (self->feedback_cache, entry);
+  return entry;
+}
+
+/* Fold a confidently matched probe into the cached gallery for this print. */
+static void
+feedback_teach (FpDeviceEgis0575 *self, GBytes *enrolled_id,
+                const Egis0575MFeatureSet *probe, int best_score)
+{
+  Egis0575FeedbackEntry *entry = feedback_cache_lookup (self, enrolled_id);
+  gint dedup_gate = self->enroll_sim_threshold > 0 ?
+                    self->enroll_sim_threshold : EGIS0575_ENROLL_SIM_THRESHOLD_DEFAULT;
+
+  if (!entry)
+    return;
+
+  /* A hand-crafted enrolled blob can exceed the cap on its own (unpack
+   * tolerates up to 64 frames); leave such galleries untouched. */
+  if (entry->n_enrolled >= EGIS0575_VERIFY_FEEDBACK_MAX_FRAMES)
+    return;
+
+  /* Same-placement repeat of a pooled frame: nothing new to learn. */
+  for (guint i = 0; i < entry->n_frames; i++)
+    if (egis0575_m_score (probe, &entry->frames[i], NULL) >= dedup_gate)
+      {
+        fp_dbg ("Verify feedback: probe duplicates gallery frame %u; skipping", i);
+        return;
+      }
+
+  if (entry->n_frames >= EGIS0575_VERIFY_FEEDBACK_MAX_FRAMES)
+    {
+      /* FIFO among taught frames; the enrolled frames stay pinned. */
+      guint n_taught = entry->n_frames - entry->n_enrolled;
+
+      if (n_taught > 1)
+        memmove (&entry->frames[entry->n_enrolled], &entry->frames[entry->n_enrolled + 1],
+                 (n_taught - 1) * sizeof (Egis0575MFeatureSet));
+      entry->n_frames--;
+    }
+
+  entry->frames[entry->n_frames++] = *probe;
+  fp_info ("Verify feedback: taught new frame (score %d, gallery now %u frames, %u taught)",
+           best_score, entry->n_frames, entry->n_frames - entry->n_enrolled);
+}
+
 static void
 clear_background (FpDeviceEgis0575 *self)
 {
@@ -567,6 +800,22 @@ count_nonzero_bytes (FpiUsbTransfer *transfer)
       nonzero++;
 
   return nonzero;
+}
+
+/* A frame whose every byte is identical (all-0x00 cold, all-0xFF broken
+ * imaging) carries no structure. Healthy idle frames have a narrow but
+ * non-zero spread, so uniformity is a clean "imaging is broken" signal. */
+static gboolean
+frame_is_uniform (FpiUsbTransfer *transfer)
+{
+  if (transfer->actual_length == 0)
+    return TRUE;
+
+  for (size_t i = 1; i < transfer->actual_length; i++)
+    if (transfer->buffer[i] != transfer->buffer[0])
+      return FALSE;
+
+  return TRUE;
 }
 
 /* Population standard deviation of the raw frame: idle frames stay below
@@ -1459,6 +1708,7 @@ finalize_verify (FpDeviceEgis0575 *self, FpiSsm *ssm, FpDevice *dev)
   g_autoptr(GVariant) stored = NULL;
   gboolean match = FALSE;
   int best_overall = 0;
+  const Egis0575MFeatureSet *best_probe = NULL;
 
   fpi_device_get_verify_data (dev, &verify_print);
   g_object_get (verify_print, "fpi-data", &stored, NULL);
@@ -1483,12 +1733,25 @@ finalize_verify (FpDeviceEgis0575 *self, FpiSsm *ssm, FpDevice *dev)
                                  self->verify_gallery_n, &best))
         match = TRUE;
       if (best > best_overall)
-        best_overall = best;
+        {
+          best_overall = best;
+          best_probe = probe;
+        }
     }
 
   fp_info ("Verify (multi-frame): probes=%u best_score=%d/%d => %s",
            self->verify_probes->len, best_overall, EGIS0575_M_MATCH_THRESHOLD,
            match ? "MATCH" : "NO-MATCH");
+
+  /* Template feedback: only a confident match may teach (see the rails on
+   * feedback_teach). Runs before verify_probes is truncated. */
+  if (match && self->verify_feedback && best_probe &&
+      best_overall >= EGIS0575_M_MATCH_THRESHOLD + EGIS0575_VERIFY_FEEDBACK_MIN_MARGIN)
+    {
+      g_autoptr(GBytes) enrolled_id = g_variant_get_data_as_bytes (stored);
+
+      feedback_teach (self, enrolled_id, best_probe, best_overall);
+    }
 
   g_ptr_array_set_size (self->verify_probes, 0);
 
@@ -1572,7 +1835,8 @@ on_frame_accepted_enroll (FpDevice *dev,
   if (self->enroll_stage < EGIS0575_ENROLL_FRAMES)
     return;
 
-  GVariant *feats = pack_feature_frames (self->enroll_feats, EGIS0575_ENROLL_FRAMES);
+  GVariant *feats = pack_feature_frames (self->enroll_feats, EGIS0575_ENROLL_FRAMES,
+                                         self->calibration);
   fpi_print_set_type (enroll_print, FPI_PRINT_RAW);
   g_object_set (enroll_print, "fpi-data", feats, NULL);
 
@@ -1671,6 +1935,27 @@ save_img (FpiUsbTransfer *transfer, FpDevice *dev)
     {
       if (has_valid_data)
         {
+          /* Adopted-calibration recovery self-check: imaging after the
+           * embedded-block upload must produce structured frames. A uniform
+           * frame (e.g. the all-0xFF failure observed 2026-09-15) means the
+           * adoption failed — discard it and fall back to patient re-reads
+           * instead of hanging the action on a dead sensor pipeline. */
+          if (self->cal_recovery_adopted)
+            {
+              if (frame_is_uniform (transfer))
+                {
+                  fp_warn ("Adopted calibration produced uniform frames; resuming calibration re-reads (%u/%d)",
+                           self->cal_read_recoveries, EGIS0575_CAL_READ_MAX_RECOVERIES);
+                  self->cal_recovery_adopted = FALSE;
+                  g_clear_pointer (&self->calibration, g_free);
+                  self->background_warmup_remaining = EGIS0575_BACKGROUND_WARMUP_FRAMES;
+                  fpi_ssm_jump_to_state_delayed (ssm, SM_CAL_START,
+                                                 EGIS0575_CAL_REREAD_DELAY_MS);
+                  return;
+                }
+              fp_info ("Adopted calibration produces structured frames; recovery complete");
+              self->cal_recovery_adopted = FALSE;
+            }
           update_warm_background (self, transfer);
           self->background_warmup_remaining--;
           fp_dbg ("Background warmup: grabbed idle baseline (%u frame(s) left)",
@@ -1739,7 +2024,7 @@ save_img (FpiUsbTransfer *transfer, FpDevice *dev)
       if (has_valid_data && sensor_health_watchdog (self, transfer, ssm, dev))
         return;   /* watchdog redirected the SSM into recovery */
       /* Duty-cycled idle frame poll */
-      fpi_ssm_jump_to_state_delayed (ssm, SM_INIT, idle_frame_delay_ms (self));
+      fpi_ssm_jump_to_state_delayed (ssm, SM_INIT, idle_frame_delay_ms (self, dev));
       return;
     }
 
@@ -1825,9 +2110,9 @@ save_img (FpiUsbTransfer *transfer, FpDevice *dev)
       }
 
     /* Settle window: finger just landed, let the press stabilise. */
-    if (elapsed < EGIS0575_FINGER_SETTLE_MS * 1000)
+    if (elapsed < self->finger_settle_ms * 1000)
       {
-        fp_dbg ("Finger settling (%lld ms / %d ms)", (long long) (elapsed / 1000), EGIS0575_FINGER_SETTLE_MS);
+        fp_dbg ("Finger settling (%lld ms / %u ms)", (long long) (elapsed / 1000), self->finger_settle_ms);
         restart_for_next_poll (self, ssm, dev, "finger settling");
         return;
       }
@@ -2360,6 +2645,21 @@ cal_status_poll_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data,
 
   if (self->cal_poll_iters++ > EGIS0575_CAL_POLL_MAX_ITERS)
     {
+      /* Same bounded patience as broken calibration reads: post-session
+       * states can stall the phase polls entirely (observed 2026-09-15/16
+       * after rapid session clusters); re-running the chain after a pause
+       * recovers. With a calibration block already in hand (adopted or
+       * cached) SM_CAL_START takes the fast re-arm path. */
+      if (self->cal_read_recoveries < EGIS0575_CAL_READ_MAX_RECOVERIES)
+        {
+          self->cal_read_recoveries++;
+          self->cal_poll_iters = 0;
+          fp_warn ("Calibration status poll did not converge; retrying chain (%u/%d)",
+                   self->cal_read_recoveries, EGIS0575_CAL_READ_MAX_RECOVERIES);
+          fpi_ssm_jump_to_state_delayed (transfer->ssm, SM_CAL_START,
+                                         EGIS0575_CAL_REREAD_DELAY_MS);
+          return;
+        }
       fpi_ssm_mark_failed (transfer->ssm,
                            fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
                                                      "calibration status poll did not converge"));
@@ -2473,6 +2773,15 @@ ssm_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case SM_CAL_READ_REQ:
+      /* Adopted-calibration recovery: the register phases have run and the
+       * embedded block is already in place, so skip the sensor read (it would
+       * return the invalidated all-zero block and overwrite the good copy)
+       * and continue with the 97 reset + upload half of the chain. */
+      if (self->cal_recovery_adopted)
+        {
+          fpi_ssm_jump_to_state (ssm, SM_PRE_RESET);
+          break;
+        }
       cal_send (ssm, dev, (const unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x72, 0x14, 0xec}, 7,
                 fpi_ssm_usb_transfer_cb);
       break;
@@ -2506,12 +2815,71 @@ ssm_run_state (FpiSsm *ssm, FpDevice *dev)
                 broken = FALSE;
                 break;
               }
-          }
+            }
+
+        /* Head/tail fingerprint of every read: a stale idle frame misread as
+         * the calibration block (FIFO residue) has a frame-like head, a
+         * firmware-side invalid block does not — the bytes tell them apart. */
+        fp_dbg ("Calibration block: head %02x %02x %02x %02x %02x %02x, tail %02x %02x %02x %02x%s",
+                self->calibration[0], self->calibration[1], self->calibration[2],
+                self->calibration[3], self->calibration[4], self->calibration[5],
+                self->calibration[EGIS0575_IMGSIZE - 4], self->calibration[EGIS0575_IMGSIZE - 3],
+                self->calibration[EGIS0575_IMGSIZE - 2], last_byte,
+                broken ? " (broken)" : "");
 
         if (broken)
           {
-            fp_warn ("Calibration block broken (trailing run of identical bytes); retry later");
+            fp_warn ("Calibration block broken (tail run of 0x%02x; head %02x %02x %02x %02x %02x %02x)",
+                     last_byte,
+                     self->calibration[0], self->calibration[1], self->calibration[2],
+                     self->calibration[3], self->calibration[4], self->calibration[5]);
             g_clear_pointer (&self->calibration, g_free);
+
+            self->cal_read_recoveries++;
+
+            /* Attempt 1: an immediate re-read absorbs transient corruption. */
+            if (self->cal_read_recoveries == 1)
+              {
+                fp_warn ("Recovering: immediate re-read (1/%d)",
+                         EGIS0575_CAL_READ_MAX_RECOVERIES);
+                fpi_ssm_jump_to_state_delayed (ssm, SM_CAL_START,
+                                               EGIS0575_STARTUP_TIMEOUT_RECOVERY_DELAY_MS);
+                return;
+              }
+
+            /* Attempt 2: adopt the verify template's embedded calibration
+             * block (v2 prints) — the host-side cache Windows keeps, carried
+             * through fprintd's print storage. Runs the full open chain with
+             * the sensor-side read replaced by the embedded copy (the
+             * register phases and the 97 reset are required: the bare
+             * claim-recycle re-arm path uploads onto a healthy sensor, which
+             * this one is not — observed 2026-09-15: POST_RESET+upload alone
+             * produced all-0xFF frames). The first captured frame is checked
+             * for structure (save_img) so a failed adoption falls back to
+             * the patient re-reads below instead of hanging the action. */
+            if (self->cal_read_recoveries == 2 && self->embedded_cal)
+              {
+                fp_warn ("Recovering: uploading the template-embedded calibration block");
+                self->calibration = g_memdup2 (self->embedded_cal, EGIS0575_IMGSIZE);
+                self->cal_recovery_adopted = TRUE;
+                self->cal_poll_iters = 0;
+                fpi_ssm_jump_to_state (ssm, SM_CAL_PHASE_1);
+                return;
+              }
+
+            /* Further attempts: the firmware rebuild takes seconds; keep
+             * re-reading at 1 Hz until the block is back (bounded). */
+            if (self->cal_read_recoveries <= EGIS0575_CAL_READ_MAX_RECOVERIES)
+              {
+                fp_warn ("Recovering: waiting for firmware self-calibration, re-read (%u/%d)",
+                         self->cal_read_recoveries, EGIS0575_CAL_READ_MAX_RECOVERIES);
+                fpi_ssm_jump_to_state_delayed (ssm, SM_CAL_START,
+                                               EGIS0575_CAL_REREAD_DELAY_MS);
+                return;
+              }
+
+            fp_warn ("Calibration read still broken after %d recoveries; retry later",
+                     EGIS0575_CAL_READ_MAX_RECOVERIES);
             fpi_ssm_mark_failed (ssm,
                                  fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
                                                            "broken calibration block, retry later"));
@@ -2740,6 +3108,8 @@ reset_action_state (FpDeviceEgis0575 *self)
   self->timeout_recoveries = 0;
   self->transfer_in_flight = FALSE;
   self->cal_poll_iters = 0;
+  self->cal_read_recoveries = 0;
+  self->cal_recovery_adopted = FALSE;
   self->weak_press_events = 0;
   self->weak_press_window_start = 0;
   self->background_warmup_remaining = EGIS0575_BACKGROUND_WARMUP_FRAMES;
@@ -2959,7 +3329,9 @@ close_poll_cb (FpDevice *dev, gpointer user_data)
  * as a host-side cache (Windows behaves the same way, protocol.md §4C) —
  * SM_CAL_START re-uploads it instead of re-running the read-out chain.
  * It is dropped by the sensor-health watchdog, the broken-block check,
- * and dispose. */
+ * and dispose. The verify-feedback cache likewise survives close (it only
+ * pays off across actions within the fprintd process) and is dropped by
+ * dispose. */
 static void
 egis0575_release_buffers (FpDeviceEgis0575 *self)
 {
@@ -2967,6 +3339,7 @@ egis0575_release_buffers (FpDeviceEgis0575 *self)
   g_clear_pointer (&self->verify_probes, g_ptr_array_unref);
   g_clear_pointer (&self->verify_gallery, g_free);
   self->verify_gallery_n = 0;
+  g_clear_pointer (&self->embedded_cal, g_free);
   g_clear_pointer (&self->enroll_feats, g_free);
 }
 
@@ -3046,8 +3419,10 @@ dev_verify (FpDevice *dev)
 
   fpi_device_get_verify_data (dev, &verify_print);
   g_object_get (verify_print, "fpi-data", &stored, NULL);
+  g_clear_pointer (&self->embedded_cal, g_free);
   if (!stored || !unpack_feature_frames (stored, &self->verify_gallery,
-                                         &self->verify_gallery_n))
+                                         &self->verify_gallery_n,
+                                         &self->embedded_cal))
     {
       /* Fail fast: running a whole capture turn only to report a bad
        * template afterwards wastes seconds and confuses the user. */
@@ -3072,6 +3447,32 @@ dev_verify (FpDevice *dev)
                                   fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
                                                             "enrolled print has too few EH575 frames to ever match; delete it and re-enroll"));
       return;
+    }
+
+  /* Template feedback: swap in the adapted gallery if this print has one
+   * cached, otherwise seed the cache from the enrolled template so later
+   * verifies pick up taught frames. */
+  if (self->verify_feedback)
+    {
+      g_autoptr(GBytes) enrolled_id = g_variant_get_data_as_bytes (stored);
+      Egis0575FeedbackEntry *entry = feedback_cache_lookup (self, enrolled_id);
+
+      if (entry)
+        {
+          g_clear_pointer (&self->verify_gallery, g_free);
+          self->verify_gallery = g_malloc (entry->n_frames * sizeof (Egis0575MFeatureSet));
+          memcpy (self->verify_gallery, entry->frames,
+                  entry->n_frames * sizeof (Egis0575MFeatureSet));
+          self->verify_gallery_n = entry->n_frames;
+          if (entry->n_frames > entry->n_enrolled)
+            fp_info ("Verify using feedback-adapted gallery (%u enrolled + %u taught frames)",
+                     entry->n_enrolled, entry->n_frames - entry->n_enrolled);
+        }
+      else
+        {
+          feedback_cache_store (self, enrolled_id,
+                                self->verify_gallery, self->verify_gallery_n);
+        }
     }
 
   dump_verify_gallery (dev);
@@ -3123,6 +3524,21 @@ fpi_device_egis0575_init (FpDeviceEgis0575 *self)
                  env, G_MAXINT);
     }
 
+  self->finger_settle_ms = EGIS0575_FINGER_SETTLE_MS_DEFAULT;
+  env = g_getenv ("EGIS0575_FINGER_SETTLE_MS");
+  if (env && env[0])
+    {
+      gint64 parsed = g_ascii_strtoll (env, NULL, 10);
+
+      if (parsed >= 0 && parsed <= EGIS0575_TURN_TIMEOUT_MS)
+        self->finger_settle_ms = (guint) parsed;
+      else
+        fp_warn ("Ignoring EGIS0575_FINGER_SETTLE_MS=%s (must be 0..%d)",
+                 env, EGIS0575_TURN_TIMEOUT_MS);
+    }
+
+  self->verify_feedback = (g_strcmp0 (g_getenv ("EGIS0575_VERIFY_FEEDBACK"), "0") != 0);
+
   self->padded_img_width = ((self->active_width + 3) / 4) * 4;
 }
 
@@ -3132,6 +3548,7 @@ fpi_device_egis0575_dispose (GObject *object)
   FpDeviceEgis0575 *self = FPI_DEVICE_EGIS0575 (object);
 
   g_clear_pointer (&self->calibration, g_free);
+  g_clear_pointer (&self->feedback_cache, g_ptr_array_unref);
   egis0575_release_buffers (self);
 
   G_OBJECT_CLASS (fpi_device_egis0575_parent_class)->dispose (object);

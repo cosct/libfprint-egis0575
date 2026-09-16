@@ -176,9 +176,22 @@ de-identified test vectors and the eval scripts) is open item §9.
 ### Differences from the original Windows engine
 The original uses threshold 660 (adaptive −80/+60, capped at 1.5×); this
 driver uses a fixed 335 plus dual-frame agreement (2 frames × ≥150)
-because the C port's score scale differs. The adaptive threshold and the
-verification-time template feedback (encrypted registry blob 'AE') were
-not ported.
+because the C port's score scale differs. The adaptive threshold remains
+unported; verification-time template feedback (the analogue of the
+encrypted registry blob 'AE') is implemented as an **in-process in-memory
+variant** (2026-09-14): probes matching with margin (≥ threshold + 30)
+are taught into the in-memory gallery (capped at 16 frames per print =
+12 enrolled + 4 taught; FIFO evicts taught frames only; same-placement
+probes are deduped via the enrollment similarity gate). The cache lives
+for the fprintd process lifetime — fprintd exits after 30 s idle by
+default, so keeping it across unlock sessions needs a resident fprintd
+(systemd drop-in: a clearing `ExecStart=` line, then
+`ExecStart=/usr/lib/fprintd -t`, at the cost of continuous low-rate
+sensor polling, covered by the §7 item-8 watchdog).
+FAR impact: the 47-point impostor margin was calibrated on a 12-frame
+gallery; the 16-frame cap hands out at most 4 extra "lottery tickets",
+and the 365 teach gate sits 77 points above the impostor peak of 288;
+re-check after sample expansion.
 
 ## 7. Stability engineering results (all hardware-verified)
 
@@ -203,8 +216,9 @@ not ported.
    the shutdown sequence (item 3) is the main mitigation
 8. Long-session progressive desensitization (>10 min polling, coverage
    50%→2–5%) → **in-driver watchdog shipped with v0.2.0**: 10-minute
-   prophylactic full re-init + weak-press degradation detection (≥20 frames
-   in an 8 s window) → claim recycle + calibration-chain re-run; the hard
+   prophylactic full re-init + weak-press degradation detection (≥8 frames
+   in an 8 s window, lowered from 20 on 2026-09-16 so mildly desensitized
+   intermittent re-presses also trigger) → claim recycle + calibration-chain re-run; the hard
    hang case of item 7 still needs the manual USBDEVFS_RESET script
 
 ## 8. Upstream issues found
@@ -224,8 +238,12 @@ not ported.
    peaking at 321 remain unlabeled) — keep widening the dataset
 3. Automatic USBDEVFS_RESET for hard frame-read hangs (2 s timeouts don't
    even fire, SIGINT chain dead — §7 item 7); the desensitization watchdog
-   is already in-driver (§7 item 8), only this extreme case still needs the
-   manual scripts/reset-sensor.sh
+   is already in-driver (§7 item 8), and broken calibration reads
+   (including the all-zero-block form observed 2026-09-14/15: the firmware
+   rebuilds it in the background over seconds-to-minutes) are now covered
+   by in-driver recovery (immediate re-read → template-embedded copy →
+   patient 1 Hz re-reads, up to 7 recoveries, see protocol §8 item 3); only the
+   hard frame-read hang still needs the manual scripts/reset-sensor.sh
 4. Long-run adaptive matching threshold (Windows has it; not ported)
 5. Upstream patch preparation (separate matcher file + protocol docs),
    targeting [libfprint upstream](https://gitlab.freedesktop.org/libfprint/libfprint)

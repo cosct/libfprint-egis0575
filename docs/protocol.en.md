@@ -157,7 +157,12 @@ and feeds it back explicitly. This driver originally followed topni1's shape (fr
 open); as of v0.2.1 the calibration block is cached host-side: it survives
 close (dropped by the watchdog/broken-check/dispose paths) and later opens
 re-upload it directly via 73 14 ec, with the sensor-health watchdog as the
-invalidation trigger (Windows-shaped; see §7).
+invalidation trigger (Windows-shaped; see §7). As of 2026-09-15 (template
+v2) the block is additionally persisted inside the enrolled template:
+fprintd's print storage takes over the role of Windows' registry cache, so
+when the sensor-side read is invalidated (the post-session all-zero block
+of §8 item 3) the template's copy is uploaded instead, recovering
+instantly.
 
 ## 5. Capture loop
 
@@ -201,8 +206,9 @@ invalidation trigger (Windows-shaped; see §7).
 Conclusion: Windows keeps the sensor healthy via a **duty cycle below
 0.1%** (full-speed capture only for a few seconds while the auth UI is
 active). fprintd semantics require continuous finger-state reporting, so
-"don't babysit" cannot be copied. This driver's adaptation: two-tier slow
-frame polling (230 ms / ~7% duty after finger activity, dropping to
+"don't babysit" cannot be copied. This driver's adaptation: three-tier slow
+frame polling (120 ms for 15 s after action start / finger events; 230 ms / ~7%
+duty after finger activity, dropping to
 500 ms / ~3% after 30 s of quiet) + the in-driver sensor-health watchdog
 (10-minute prophylactic re-init + weak-press degradation detection that
 automatically re-runs the calibration chain) + the host-side calibration
@@ -222,7 +228,23 @@ manual `scripts/reset-sensor.sh`.
    first PHASE_1 packet. Countermeasure: `USBDEVFS_RESET` soft reset
    (scripts/reset-sensor.sh; works with the uaccess ACL, no root needed)
 3. Calibration-block reads can be corrupt (≥100 identical tail bytes,
-   observed 0x3f) — the driver detects this
+   observed 0x3f; new form observed 2026-09-14/15: post-session reads
+   return **all-zero blocks** = the firmware calibration RAM is invalidated
+   and rebuilt by the firmware in the background over seconds-to-minutes
+   (in-chain 97 soft resets do not speed it up; an in-driver USB port reset
+   actually wedges the chain's polls for minutes, so plain waiting is the
+   reliable heal)) — the driver auto-recovers (final design 2026-09-15:
+   immediate re-read to absorb transient corruption → the v2 template's
+   embedded calibration copy runs the full open chain (register phases +
+   97 reset + upload, with a structure self-check on the first warmup
+   frame that falls back to re-reads on failure) — the Windows host-side
+   cache carried through fprintd storage → without an embedded copy,
+   patient 1 Hz re-reads until the firmware rebuild finishes;
+   phase-poll non-convergence (seen after rapid session clusters,
+   2026-09-16) joins the same retry chain, failing only after 7
+   recoveries; every read logs its head/tail
+   bytes to distinguish "FIFO-residue frame data" from "firmware-side
+   invalid block")
 4. No calibration → all-zero frames (§4B); bare `73 14 ec` deadlocks the
    transport on the second attempt
 5. `63 01 02 0f 03` responds with 9 bytes (§2)

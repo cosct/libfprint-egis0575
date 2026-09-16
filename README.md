@@ -26,6 +26,13 @@
 - **v0.2.1 优化**：录入同点重复拒绝（Windows HIGHLY_SIMILARITY 移植，
   阈值 650 真机验证拦截精准）、校准块跨 close 主机缓存（Windows 同型）、
   两档空闲轮询（230/500ms）
+- **master 未发布**：解锁时延压缩（verify/enroll 动作开始/手指事件后 15s 内
+  120ms 快速轮询 + 按压稳定窗 400→250ms）、验证模板回馈（Windows 'AE' blob 的内存版：
+  高置信匹配帧回授模板库，进程生命周期内越用越贴合，
+  [comparison §6](docs/comparison.md#与-windows-原版的差异)）、
+  模板 v2 内嵌校准块（传感器侧读数失效时上传模板内副本瞬时恢复，见
+  [protocol §8 第 3 条](docs/protocol.md#8-已知陷阱全部真机验证2026-09-1213)；
+  **建议重录指纹获得 v2 模板**，v1 模板仍可正常验证）
 - **待办**：扩样本调优阈值、多机型反馈、上游化补丁
 
 ## 文档导航
@@ -101,6 +108,13 @@ egis_matcher.py 的特征提取与 eval_sigfm 需 OpenCV，hwpoll 另需 pyusb�
 - `EGIS0575_DISABLE_STRETCH=1` — 关闭 stretch5 对比度增强
 - `EGIS0575_ENROLL_SIM_THRESHOLD` — 录入同点重复拒绝阈值（默认 650；
   0 关闭。标定见 [enroll-sim-calibration.txt](docs/enroll-sim-calibration.txt)）
+- `EGIS0575_FINGER_SETTLE_MS` — 按压稳定窗（默认 250ms；调小解锁更快但
+  不稳定帧更多，A/B 用）
+- `EGIS0575_VERIFY_FEEDBACK=0` — 关闭验证模板回馈（默认开：高置信匹配帧
+  回授内存模板库，随 fprintd 进程生命周期有效；让 fprintd 常驻可跨会话
+  保留——写 `/etc/systemd/system/fprintd.service.d/keepalive.conf`：
+  `[Service]` 段下先 `ExecStart=`（置空）再 `ExecStart=/usr/lib/fprintd -t`，
+  然后 `systemctl daemon-reload`；代价是传感器 24h 低速轮询，由健康看门狗兜底）
 - `EGIS0575_DEBUG_MAX_FILES` — PGM/原始帧转储的文件数上限（默认 5000，
   约 26 MB 原始帧；所有调试转储均为 0600 权限、目录 0700，因其含
   生物特征数据）

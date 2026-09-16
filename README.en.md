@@ -37,6 +37,16 @@ docs/. The end goal is a driver submittable to
   HIGHLY_SIMILARITY port, threshold 650, verified precise on hardware),
   host-side calibration cache surviving close (Windows-shaped), and
   two-tier idle polling (230/500 ms)
+- **Unreleased on master**: unlock-latency cuts (120 ms poll cadence for 15 s after
+  action start / finger events + press-settle window 400→250 ms),
+  verify-time template feedback (the in-memory analogue of the Windows
+  'AE' blob: confident-match frames taught back into the gallery for the
+  fprintd process lifetime,
+  [comparison §6](docs/comparison.en.md#6-the-windows-engine-port-the-endgame)),
+  and the v2 template embedding the calibration block (when the
+  sensor-side read is invalidated, the template's copy is uploaded for an
+  instant recovery; **re-enroll to get a v2 template** — v1 templates
+  still verify fine)
 - **Todo**: wider-sample threshold tuning, feedback from more machines,
   the upstreamable patch series
 
@@ -133,6 +143,17 @@ driver (see `LICENSE`).
 - `EGIS0575_ENROLL_SIM_THRESHOLD` — enrollment same-spot reject threshold
   (default 650; 0 disables; calibration in
   [enroll-sim-calibration.txt](docs/enroll-sim-calibration.txt))
+- `EGIS0575_FINGER_SETTLE_MS` — press-settle window (default 250 ms;
+  smaller unlocks faster at the cost of more unstable frames; A/B knob)
+- `EGIS0575_VERIFY_FEEDBACK=0` — disable verify-time template feedback
+  (default on: confident-match frames are taught into the in-memory
+  gallery, effective for the fprintd process lifetime; keep fprintd
+  resident to retain it across sessions — write
+  `/etc/systemd/system/fprintd.service.d/keepalive.conf` with an
+  `[Service]` section containing a clearing `ExecStart=` line followed by
+  `ExecStart=/usr/lib/fprintd -t`, then `systemctl daemon-reload`; at the
+  cost of continuous low-rate sensor polling, covered by the health
+  watchdog)
 - `EGIS0575_DEBUG_MAX_FILES` — file cap for PGM/raw-frame dumps (default
   5000, ≈26 MB of raw frames; all debug sinks are written 0600 into 0700
   dirs since they hold biometric data)

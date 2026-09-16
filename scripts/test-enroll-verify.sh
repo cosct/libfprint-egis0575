@@ -28,9 +28,11 @@ case "${1:-}" in
     echo "==   第 1-4 次：正常中心按压 =="
     echo "==   第 5-8 次：手指稍向下/向上轻移 2-3 毫米再按 =="
     echo "==   第 9-12 次：稍向左/向右轻移 2-3 毫米再按 =="
+    # 只显示每次按压的进度/拒绝行：原来的模式含 "finger"，会把 settle 期
+    # 19ms 一条的帧级调试行全部放出来刷屏，真正的进度反而看不见
     echo "$FINGER" | timeout -s INT -k 5 480 env G_MESSAGES_DEBUG=all \
       EGIS0575_ACTIVE_WIDTH="${EGIS0575_ACTIVE_WIDTH:-103}" \
-      "$BIN/enroll" 2>&1 | tee "$ENROLL_LOG" | grep -E "Enroll|stage|Stage-2 at|finger|Write|complete" || true
+      "$BIN/enroll" 2>&1 | tee "$ENROLL_LOG" | grep --line-buffered -E "Enroll stage [0-9]+/[0-9]+ captured|Enroll frame rejected|[Ee]nroll (complete|failed)|Failed to" || true
     echo
     # grep -c 在零匹配时返回 1，pipefail 下会杀死脚本——失败时更要打印摘要
     STAGES=$(grep -c "Enroll stage" "$ENROLL_LOG" || true)

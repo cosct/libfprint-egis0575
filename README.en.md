@@ -167,8 +167,8 @@ libfprint/ Driver source (git subtree: full upstream libfprint history +
           not committed
 scripts/  Test and data-collection tooling (probe / capture / analysis /
           calibration)
-tools/    Evaluation utilities (egis0575-matcher-test / eval_bz3 —
-          two C tools built via make; hwpoll is a Python script)
+tools/    Evaluation utilities (egis0575-matcher-test / egis0575-feedback-eval /
+          eval_bz3 — three C tools built via make; hwpoll is a Python script)
 packaging/ Release recipes: aur/PKGBUILD (canonical AUR copy) ·
           deb/build-deb.sh · rpm/libfprint-egis0575.spec — invoked by
           the release workflow on egis0575-v* tags; artifacts are

@@ -126,8 +126,8 @@ docs/     文档索引见 docs/README.md（中英双语，按板块组织）
 libfprint/ 驱动源码（git subtree：upstream libfprint 完整历史 + egis0575
           驱动，LGPL-2.1+）；构建目录 builddir/ 不入库
 scripts/  测试与数据采集工具（probe / 采集 / 分析 / 标定）
-tools/    评测小工具（egis0575-matcher-test / eval_bz3 两个 C 工具 make 构建；
-          hwpoll 为 Python 脚本）
+tools/    评测小工具（egis0575-matcher-test / egis0575-feedback-eval /
+          eval_bz3 三个 C 工具 make 构建；hwpoll 为 Python 脚本）
 packaging/ 发布打包配置：aur/PKGBUILD（AUR 版本的权威来源）· deb/build-deb.sh ·
           rpm/libfprint-egis0575.spec —— release workflow 在打
           egis0575-v* 标签时调用，产物上传至 GitHub Release 并自动更新 AUR

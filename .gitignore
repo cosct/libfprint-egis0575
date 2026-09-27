@@ -29,6 +29,7 @@ enrolled.pgm
 .mimosa/
 __pycache__/
 tools/egis0575-matcher-test
+tools/egis0575-feedback-eval
 tools/eval_bz3
 
 # ZCode/会话状态文件（本机工具产物）

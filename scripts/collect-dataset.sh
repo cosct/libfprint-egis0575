@@ -13,6 +13,11 @@ cd "$(dirname "$0")/.."
 umask 077
 
 NAME=${1:?用法: collect-dataset.sh <数据集名> [秒数]}
+# 名称进入落盘路径（datasets/${NAME}-<时间戳>）：拒绝路径分隔符、..、空格等
+if ! [[ "$NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "✗ 数据集名只能含字母/数字/._- 且以字母或数字开头（收到 '$NAME'）" >&2
+  exit 1
+fi
 DUR=${2:-60}
 if ! [[ "$DUR" =~ ^[0-9]+$ ]] || [[ "$DUR" -lt 1 ]]; then
   echo "✗ 秒数必须是正整数（收到 '$DUR'）" >&2

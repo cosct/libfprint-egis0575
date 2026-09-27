@@ -78,7 +78,7 @@ def stats (name, vals):
 def main ():
     ap = argparse.ArgumentParser ()
     ap.add_argument ("--pairs", type = int, default = 200,
-                     help = "跨按压采样对数上限")
+                     help = "各类分布的采样对数上限")
     ap.add_argument ("--seed", type = int, default = 42)
     args = ap.parse_args ()
 
@@ -94,10 +94,13 @@ def main ():
     total = sum (len (p) for _, p in presses)
     print (f"语料：{len(presses)} 次按压 / {total} 帧\n")
 
-    # same-press：组内两两（每按压本身就是同一次放置）
+    # same-press：组内两两（每按压本身就是同一次放置）。与 cross-press 一样
+    # 按 --pairs 采样封顶——单次按压帧多时全量组合会爆炸（每对一个子进程调用）
     same_pairs = []
     for _, pgms in presses:
         same_pairs.extend (itertools.combinations (pgms, 2))
+    rng.shuffle (same_pairs)
+    same_pairs = same_pairs[:args.pairs]
     # cross-press（确定同指）：同一会话时间戳前缀内跨按压采样。
     # 跨会话的对可能混有异指（历史冒充测试语料），单独归入参考分布。
     by_session = {}

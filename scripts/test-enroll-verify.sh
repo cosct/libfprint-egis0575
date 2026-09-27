@@ -7,6 +7,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# 模板文件（test-storage.variant）与日志含生物特征数据：不给其他用户读权限
+umask 077
+
 FINGER=${EGIS0575_TEST_FINGER:-6}   # 6=右食指, 1=左食指（可用环境变量切换槽位）
 case "$FINGER" in
   6) FINGER_NAME=右食指 ;;

@@ -234,8 +234,15 @@ re-check after sample expansion.
 1. Whether identify (1:N) can be enabled safely — gallery-size limit
    untested
 2. Impostor separation margin after recalibration is 47 points
-   (confident-impostor peak 288 vs threshold 335; four ambiguous runs
-   peaking at 321 remain unlabeled) — keep widening the dataset
+   (confident-impostor peak 288 vs threshold 335; the four ambiguous runs
+   peaking at 321 are now identified as verify-run-154913-1(299),
+   194308-4(307), 195936-2(321), 195936-4(316) and still await labels from
+   the collector; 20260916-112953-2(311) sits in the same gray zone) —
+   keep widening the dataset. The offline FAR recheck of verify-time
+   template feedback (2026-09-26, replaying 36 runs / 4 sessions) shows
+   sub-threshold runs unchanged by taught frames (321→321): feedback is
+   FAR-neutral on this corpus, see
+   [verify-feedback-eval.txt](verify-feedback-eval.txt)
 3. Automatic USBDEVFS_RESET for hard frame-read hangs (2 s timeouts don't
    even fire, SIGINT chain dead — §7 item 7); the desensitization watchdog
    is already in-driver (§7 item 8), and broken calibration reads

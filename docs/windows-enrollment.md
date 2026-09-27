@@ -108,7 +108,7 @@ CreateEnrollment 里采样数不是常量，而是三层配置的叠加：
 | 变长录入（MIN/MAX_ENROLL_COUNT + MAX_ENROLL_TRY） | 固定 12 阶段 | libfprint 的 `nr_enroll_stages` 为类初始化时静态值，变长需改框架，上游不可行；12 阶段 + 坏帧不推进（现状）已近似 |
 | 模板 = 逐帧特征池化 | 12 帧特征模板库 | 同构 ✓ |
 | Commit 前存储容量检查 | fprintd 侧管理 | 不适用 |
-| 验证期模板回馈（169959B 'AE' blob） | 未移植（已有记录） | P2 遗留 |
+| 验证期模板回馈（169959B 'AE' blob） | 已移植进程内内存版（master 默认开，`EGIS0575_VERIFY_FEEDBACK` 可关）：高置信匹配帧回授进内存模板库，随 fprintd 进程生命周期有效；加密磁盘持久化 blob 未移植 | 内存版已完成（2026-09-14）；跨会话保留可让 fprintd 常驻，见 comparison §6 |
 | 注册表 20 参数可调面 | 驱动 env vars | 研究等价物已够用 |
 
 **已移植（随 v0.2.1 发布）——录入相似帧拒绝**：`on_frame_accepted_enroll`

@@ -119,7 +119,7 @@ Defaults are set per sensor model in the engine-core constructor
 | Variable-length enrollment (MIN/MAX + MAX_TRY) | Fixed 12 stages | libfprint's `nr_enroll_stages` is static at class init; variable length needs framework changes, not upstreamable. 12 stages + rejected frames not advancing (current behavior) approximates it |
 | Template = pooled per-frame features | 12-frame feature gallery | isomorphic ✓ |
 | Storage capacity check before commit | managed by fprintd | N/A |
-| Verification-time template feedback (169959-B 'AE' blob) | not ported (already recorded) | P2 open item |
+| Verification-time template feedback (169959-B 'AE' blob) | Ported as the in-process memory version (master, on by default, `EGIS0575_VERIFY_FEEDBACK` to disable): high-confidence matched frames feed back into the in-memory gallery, valid for the fprintd process lifetime; the encrypted disk-persisted blob is not ported | done (memory version, 2026-09-14); keeping fprintd resident preserves it across sessions, see comparison §6 |
 | Registry-tunable 20-parameter surface | driver env vars | research equivalents suffice |
 
 **Ported (shipped in v0.2.1) — enrollment similarity rejection**: before

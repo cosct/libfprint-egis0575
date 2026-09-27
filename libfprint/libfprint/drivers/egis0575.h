@@ -170,6 +170,7 @@ static const Packet EGIS0575_CAL_PHASE_5_PACKETS[] = {
 };
 
 /* then send 72 14 ec and read the 5356-byte calibration block */
+static const Packet EGIS0575_CAL_READ_REQ_PACKET = {.length = 7, .sequence = (unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x72, 0x14, 0xec}, .response_length = 5356};
 
 #define EGIS0575_PRE_RESET_PACKETS_LENGTH 3
 static const Packet EGIS0575_PRE_RESET_PACKETS[] = {
@@ -177,6 +178,10 @@ static const Packet EGIS0575_PRE_RESET_PACKETS[] = {
   {.length = 6, .sequence = (unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x60, 0x01}, .response_length = 7},
   {.length = 7, .sequence = (unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x97, 0x00, 0x00}, .response_length = 7},  /* sensor reset */
 };
+
+/* post-reset status poll: keep polling until resp[5] != 0x00 (sensor is
+ * busy with the 97 reset while resp[5] stays 0x00) */
+static const Packet EGIS0575_RESET_POLL_PACKET = {.length = 6, .sequence = (unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x60, 0x00}, .response_length = 7};
 
 #define EGIS0575_POST_RESET_PACKETS_LENGTH 13
 static const Packet EGIS0575_POST_RESET_PACKETS[] = {

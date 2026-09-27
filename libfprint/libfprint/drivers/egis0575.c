@@ -473,6 +473,19 @@ pack_feature_frames (const Egis0575MFeatureSet *sets, guint n_sets,
                                                    1));
 }
 
+/* Biometric material (feature descriptors, probe/template frames) must not
+ * linger in freed heap memory. glib 2.68 (our minimum) has no
+ * g_explicit_bzero, so wipe through a volatile pointer the compiler cannot
+ * elide. */
+static void
+secure_wipe (void *p, gsize len)
+{
+  volatile guint8 *v = p;
+
+  while (len--)
+    *v++ = 0;
+}
+
 static gboolean
 unpack_feature_frames (GVariant             *data,
                        Egis0575MFeatureSet **out_sets,
@@ -483,6 +496,7 @@ unpack_feature_frames (GVariant             *data,
   GVariant *frames;
   guint8 version;
   guint n_frames, fi;
+  g_autofree guint8 *cal_copy = NULL;
 
   if (out_cal)
     *out_cal = NULL;
@@ -524,9 +538,11 @@ unpack_feature_frames (GVariant             *data,
           fp_warn ("Enrolled print embeds a %zu-byte calibration block (expected %d); ignoring it",
                    cal_len, EGIS0575_IMGSIZE);
         }
-      else if (out_cal && cal_len == EGIS0575_IMGSIZE)
+      else if (cal_len == EGIS0575_IMGSIZE)
         {
-          *out_cal = g_memdup2 (cal_data, EGIS0575_IMGSIZE);
+          /* Copied to the caller only on success: every FALSE return must
+           * leave *out_cal NULL (the autofree frees this copy otherwise). */
+          cal_copy = g_memdup2 (cal_data, EGIS0575_IMGSIZE);
         }
       g_variant_unref (cal);
     }
@@ -564,6 +580,7 @@ unpack_feature_frames (GVariant             *data,
               g_variant_unref (feat);
               g_variant_unref (frame);
               g_variant_unref (frames);
+              secure_wipe (sets, (gsize) n_frames * sizeof (*sets));
               g_free (sets);
               return FALSE;
             }
@@ -575,6 +592,9 @@ unpack_feature_frames (GVariant             *data,
       g_variant_unref (frame);
     }
   g_variant_unref (frames);
+
+  if (out_cal)
+    *out_cal = g_steal_pointer (&cal_copy);
 
   *out_sets = sets;
   *out_n = n_frames;
@@ -628,6 +648,13 @@ probe_matches_gallery (const Egis0575MFeatureSet *probe,
 #define EGIS0575_VERIFY_FEEDBACK_MAX_FRAMES 16  /* 12 enrolled + up to 4 taught */
 #define EGIS0575_VERIFY_FEEDBACK_MAX_PRINTS 4   /* cached galleries (one per enrolled finger) */
 
+static void
+feature_set_free (gpointer data)
+{
+  secure_wipe (data, sizeof (Egis0575MFeatureSet));
+  g_free (data);
+}
+
 typedef struct
 {
   GBytes              *enrolled_id;  /* serialized enrolled fpi-data: print identity */
@@ -643,6 +670,7 @@ feedback_entry_free (gpointer data)
   Egis0575FeedbackEntry *entry = data;
 
   g_bytes_unref (entry->enrolled_id);
+  secure_wipe (entry->frames, entry->n_frames * sizeof (*entry->frames));
   g_free (entry->frames);
   g_free (entry);
 }
@@ -1435,6 +1463,11 @@ create_processed_snapshot (FpDeviceEgis0575 *self,
   img->width = self->padded_img_width;
   img->height = EGIS0575_SENSOR_STRIDE_Y;
   img->flags = FPI_IMAGE_COLORS_INVERTED;
+  /* ppmm deliberately stays at fp_image_new's 0: the stage-2 gate thresholds
+   * were calibrated on hardware against NBIS minutiae behaviour at ppmm=0,
+   * and a real sensor pitch would shift that behaviour and invalidate the
+   * calibration. CAPTURE consumers therefore get a 0 ppmm and must not
+   * scale physical dimensions from the image. */
 
   for (guint src_y = 0; src_y < EGIS0575_SENSOR_STRIDE_Y; src_y++)
     for (guint src_x = 0; src_x < self->active_width; src_x++)
@@ -2645,6 +2678,16 @@ cal_status_poll_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data,
       return;
     }
 
+  /* A stop must not arm further delayed retries: the cancel watchdog would
+   * force-fail the SSM while a delayed jump is still pending, tripping the
+   * fpi-ssm pending-timeout BUG_ON. Wind down through the shutdown chain
+   * like save_img does. */
+  if (self->stop)
+    {
+      fpi_ssm_jump_to_state (transfer->ssm, SM_DONE);
+      return;
+    }
+
   if (self->cal_poll_iters++ > EGIS0575_CAL_POLL_MAX_ITERS)
     {
       /* Same bounded patience as broken calibration reads: post-session
@@ -2784,7 +2827,7 @@ ssm_run_state (FpiSsm *ssm, FpDevice *dev)
           fpi_ssm_jump_to_state (ssm, SM_PRE_RESET);
           break;
         }
-      cal_send (ssm, dev, (const unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x72, 0x14, 0xec}, 7,
+      cal_send (ssm, dev, EGIS0575_CAL_READ_REQ_PACKET.sequence, EGIS0575_CAL_READ_REQ_PACKET.length,
                 fpi_ssm_usb_transfer_cb);
       break;
 
@@ -2836,6 +2879,14 @@ ssm_run_state (FpiSsm *ssm, FpDevice *dev)
                      self->calibration[0], self->calibration[1], self->calibration[2],
                      self->calibration[3], self->calibration[4], self->calibration[5]);
             g_clear_pointer (&self->calibration, g_free);
+
+            /* Same stop rule as cal_status_poll_cb: never arm delayed
+             * re-reads while winding down. */
+            if (self->stop)
+              {
+                fpi_ssm_jump_to_state (ssm, SM_DONE);
+                return;
+              }
 
             self->cal_read_recoveries++;
 
@@ -2900,7 +2951,7 @@ ssm_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case SM_RESET_POLL_REQ:
-      cal_send (ssm, dev, (const unsigned char[]){0x45, 0x47, 0x49, 0x53, 0x60, 0x00}, 6,
+      cal_send (ssm, dev, EGIS0575_RESET_POLL_PACKET.sequence, EGIS0575_RESET_POLL_PACKET.length,
                 fpi_ssm_usb_transfer_cb);
       break;
 
@@ -2986,8 +3037,11 @@ ssm_run_state (FpiSsm *ssm, FpDevice *dev)
     case SM_START:
       if (self->stop)
         {
-          fp_dbg ("Stopping, completed capture");
-          fpi_ssm_mark_completed (ssm);
+          /* Route through SM_DONE like every other stop path: completing
+           * here directly would skip the capture-burst shutdown and leave
+           * the sensor in continuous-capture mode (EGIS0575_SHUTDOWN_PACKETS). */
+          fp_dbg ("Stopping; winding down through capture-burst shutdown");
+          fpi_ssm_jump_to_state (ssm, SM_DONE);
         }
       else
         {
@@ -3099,8 +3153,10 @@ reset_action_state (FpDeviceEgis0575 *self)
   self->capture_armed = FALSE;
   self->waiting_for_lift = FALSE;
   self->waiting_for_lift_since = 0;
-  self->frame_counter = 0;
-  self->pgm_debug_counter = 0;
+  /* frame_counter/pgm_debug_counter deliberately persist across actions:
+   * the debug-dump caps (EGIS0575_DEBUG_MAX_FILES) bound the whole process,
+   * not one action — a resident fprintd must not accumulate N × cap
+   * biometric dumps. File numbering also stays unique per process. */
   self->pgm_debug_last_capture_time = 0;
   self->frame_reads_this_claim = 0;
   self->turn_open = FALSE;
@@ -3334,15 +3390,36 @@ close_poll_cb (FpDevice *dev, gpointer user_data)
  * and dispose. The verify-feedback cache likewise survives close (it only
  * pays off across actions within the fprintd process) and is dropped by
  * dispose. */
+/* Wipe and free the enroll template gallery (12 frame feature sets). */
+static void
+wipe_enroll_feats (FpDeviceEgis0575 *self)
+{
+  if (self->enroll_feats)
+    secure_wipe (self->enroll_feats,
+                 (gsize) EGIS0575_ENROLL_FRAMES * sizeof (*self->enroll_feats));
+  g_clear_pointer (&self->enroll_feats, g_free);
+}
+
+/* Wipe and free the active verify gallery (feature template frames). */
+static void
+wipe_verify_gallery (FpDeviceEgis0575 *self)
+{
+  if (self->verify_gallery)
+    secure_wipe (self->verify_gallery,
+                 (gsize) self->verify_gallery_n * sizeof (*self->verify_gallery));
+  g_clear_pointer (&self->verify_gallery, g_free);
+  self->verify_gallery_n = 0;
+}
+
 static void
 egis0575_release_buffers (FpDeviceEgis0575 *self)
 {
   clear_background (self);
+  /* verify_probes elements are wiped by feature_set_free */
   g_clear_pointer (&self->verify_probes, g_ptr_array_unref);
-  g_clear_pointer (&self->verify_gallery, g_free);
-  self->verify_gallery_n = 0;
+  wipe_verify_gallery (self);
   g_clear_pointer (&self->embedded_cal, g_free);
-  g_clear_pointer (&self->enroll_feats, g_free);
+  wipe_enroll_feats (self);
 }
 
 static void
@@ -3367,7 +3444,7 @@ dev_enroll (FpDevice *dev)
   FpDeviceEgis0575 *self = FPI_DEVICE_EGIS0575 (dev);
 
   fp_dbg ("Enroll requested");
-  g_clear_pointer (&self->enroll_feats, g_free);
+  wipe_enroll_feats (self);
   self->enroll_feats = g_new0 (Egis0575MFeatureSet, EGIS0575_ENROLL_FRAMES);
   self->enroll_stage = 0;
 
@@ -3414,10 +3491,9 @@ dev_verify (FpDevice *dev)
 
   fp_dbg ("Verify requested (multi-frame probes)");
   g_clear_pointer (&self->verify_probes, g_ptr_array_unref);
-  self->verify_probes = g_ptr_array_new_with_free_func (g_free);
+  self->verify_probes = g_ptr_array_new_with_free_func (feature_set_free);
 
-  g_clear_pointer (&self->verify_gallery, g_free);
-  self->verify_gallery_n = 0;
+  wipe_verify_gallery (self);
 
   fpi_device_get_verify_data (dev, &verify_print);
   g_object_get (verify_print, "fpi-data", &stored, NULL);
@@ -3461,7 +3537,7 @@ dev_verify (FpDevice *dev)
 
       if (entry)
         {
-          g_clear_pointer (&self->verify_gallery, g_free);
+          wipe_verify_gallery (self);
           self->verify_gallery = g_malloc (entry->n_frames * sizeof (Egis0575MFeatureSet));
           memcpy (self->verify_gallery, entry->frames,
                   entry->n_frames * sizeof (Egis0575MFeatureSet));

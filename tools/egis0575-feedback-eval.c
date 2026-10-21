@@ -69,6 +69,7 @@ typedef struct
   int                fb_best;
   int                fb_match;    /* verdict under feedback simulation */
   int                taught_this_run;
+  int                sc_rescued;  /* verdict flipped by the second-chance retry */
 } Run;
 
 typedef struct
@@ -174,7 +175,7 @@ score_vs (const Egis0575MFeatureSet *probe, const Egis0575MFeatureSet *frame)
 static int
 probe_match (const Egis0575MFeatureSet *probe,
              const Egis0575MFeatureSet *gallery, int n_gallery,
-             int *best_out, int *agree_out)
+             int *best_out, int *agree_out, int *rescued_out)
 {
   int best = 0, agree = 0;
 
@@ -186,6 +187,28 @@ probe_match (const Egis0575MFeatureSet *probe,
       if (s >= EGIS0575_M_AGREE_SCORE)
         agree++;
     }
+
+  /* Second chance (driver port of the Windows engine tail): best passes but
+   * agree falls short -> one re-match with doubled tolerances. */
+  if (rescued_out)
+    *rescued_out = 0;
+  if (best >= EGIS0575_M_MATCH_THRESHOLD && agree < EGIS0575_M_AGREE_FRAMES)
+    {
+      int relaxed = 0;
+
+      for (int g = 0; g < n_gallery; g++)
+        if (egis0575_m_score_ex (probe, &gallery[g], NULL,
+                                 EGIS0575_M_SC_POS_TOL_PX,
+                                 EGIS0575_M_SC_ANGLE_TOL_DEG) >= EGIS0575_M_AGREE_SCORE)
+          relaxed++;
+      if (relaxed >= EGIS0575_M_AGREE_FRAMES)
+        {
+          agree = relaxed;
+          if (rescued_out)
+            *rescued_out = 1;
+        }
+    }
+
   *best_out = best;
   *agree_out = agree;
   return best >= EGIS0575_M_MATCH_THRESHOLD && agree >= EGIS0575_M_AGREE_FRAMES;
@@ -554,7 +577,7 @@ main (int argc, char **argv)
       for (int p = 0; p < r->n_probes; p++)
         {
           int best, agree;
-          probe_match (&r->probes[p], s->enrolled, s->n_enrolled, &best, &agree);
+          probe_match (&r->probes[p], s->enrolled, s->n_enrolled, &best, &agree, NULL);
           if (best > r->base_best)
             {
               r->base_best = best;
@@ -570,9 +593,11 @@ main (int argc, char **argv)
 
         for (int p = 0; p < r->n_probes; p++)
           {
-            int best, agree;
+            int best, agree, rescued;
             int m = probe_match (&r->probes[p], s->frames, s->n_frames,
-                                 &best, &agree);
+                                 &best, &agree, &rescued);
+            if (rescued)
+              r->sc_rescued = 1;
 
             if (best > best_overall)
               {
@@ -597,7 +622,7 @@ main (int argc, char **argv)
     }
 
   /* ---- report ---- */
-  int total_probes = 0, scored_runs = 0, unscorable = 0;
+  int total_probes = 0, scored_runs = 0, unscorable = 0, sc_total = 0;
   for (int i = 0; i < n_runs; i++)
     {
       total_probes += runs[i].n_probes;
@@ -635,10 +660,14 @@ main (int argc, char **argv)
             continue;
           if (r->base_best >= 300 && r->base_best < 349)
             mark = "  <== 灰区";  /* below trusted-genuine floor 349 */
+          else if (r->sc_rescued)
+            mark = "  <== 二次机会救回";
           printf ("  %-38s %4d %6d %6d %6s %5s%s\n",
                   r->name, r->n_probes, r->base_best, r->fb_best,
                   r->fb_match ? "MATCH" : "-",
                   r->taught_this_run ? "是" : "", mark);
+          if (r->sc_rescued)
+            sc_total++;
 
           if (r->base_best < EGIS0575_M_MATCH_THRESHOLD)
             {
@@ -655,6 +684,7 @@ main (int argc, char **argv)
     }
 
   printf ("== 回馈安全性（本会话语料内）==\n");
+  printf ("二次机会（宽容差重匹配）救回的运行数：%d（冒充侧翻转须为 0）\n", sc_total);
   printf ("基线低于阈值 %d 的运行：基线峰值 %d，回馈后峰值 %d%s\n",
           EGIS0575_M_MATCH_THRESHOLD, global_low_max_base, global_low_max_fb,
           global_low_max_fb >= EGIS0575_M_MATCH_THRESHOLD
@@ -683,7 +713,7 @@ main (int argc, char **argv)
           for (int p = 0; p < r->n_probes; p++)
             {
               probe_match (&r->probes[p], sessions[sj].frames,
-                           sessions[sj].n_frames, &best, &agree);
+                           sessions[sj].n_frames, &best, &agree, NULL);
               if (best > cross_max)
                 {
                   cross_max = best;

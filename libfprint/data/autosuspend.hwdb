@@ -77,11 +77,6 @@ usb:v1C7Ap0571*
  ID_AUTOSUSPEND=1
  ID_PERSIST=0
 
-# Supported by libfprint driver egis0575
-usb:v1C7Ap0575*
- ID_AUTOSUSPEND=1
- ID_PERSIST=0
-
 # Supported by libfprint driver egis_etu905
 usb:v1C7Ap05AE*
 usb:v1C7Ap9201*

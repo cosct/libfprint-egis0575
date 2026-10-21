@@ -176,10 +176,17 @@ de-identified test vectors and the eval scripts) is open item §9.
 ### Differences from the original Windows engine
 The original uses threshold 660 (adaptive −80/+60, capped at 1.5×); this
 driver uses a fixed 335 plus dual-frame agreement (2 frames × ≥150)
-because the C port's score scale differs. The adaptive threshold remains
-unported; verification-time template feedback (the analogue of the
-encrypted registry blob 'AE') is implemented as an **in-process in-memory
-variant** (2026-09-14): probes matching with margin (≥ threshold + 30)
+because the C port's score scale differs. A 2026-10-04 recheck argued the
+adaptive threshold **not portable** at our calibration (the mechanism is
+anti-hammering hysteresis, not leniency — the wrong direction for FRR, and
+the 14-point genuine margin admits no upward walk, see
+[windows-agc-threshold.en.md](windows-agc-threshold.en.md) §3.3); in its
+place the **low-votes second chance** landed (2026-10-04, default on):
+when best clears the threshold but agree falls short, one re-match with
+doubled tolerances — offline it rescued one genuine run with zero impostor
+flips (same doc §4.1). Verification-time template feedback (the analogue
+of the encrypted registry blob 'AE') is implemented as an **in-process
+in-memory variant** (2026-09-14): probes matching with margin (≥ threshold + 30)
 are taught into the in-memory gallery (capped at 16 frames per print =
 12 enrolled + 4 taught; FIFO evicts taught frames only; same-placement
 probes are deduped via the enrollment similarity gate). The cache lives
@@ -220,6 +227,17 @@ re-check after sample expansion.
    in an 8 s window, lowered from 20 on 2026-09-16 so mildly desensitized
    intermittent re-presses also trigger) → claim recycle + calibration-chain re-run; the hard
    hang case of item 7 still needs the manual USBDEVFS_RESET script
+9. **Firmware death by USB runtime autosuspend (production incident
+   2026-10-11, enumeration level)**: ~1.5 h idle → wake failure → libusb
+   open EIO + disconnect + enumeration -110 storm; port power-cycling and
+   warm reboots ineffective, only a full cold start recovered it. Root
+   cause is the firmware's suspend/resume path (inferred); the fix is
+   entirely in power management (the driver protocol layer cannot
+   intervene — the failure precedes libusb open): from v0.2.3-3 this
+   package's hwdb drops the ID_AUTOSUSPEND marking for 0575
+   (`fprint-list-udev-hwdb.c` denylist), with three host-side backstops
+   (hwdb override / udev rule / TLP denylist). Full checklist in
+   protocol §8 item 7
 
 ## 8. Upstream issues found
 
@@ -251,6 +269,10 @@ re-check after sample expansion.
    by in-driver recovery (immediate re-read → template-embedded copy →
    patient 1 Hz re-reads, up to 7 recoveries, see protocol §8 item 3); only the
    hard frame-read hang still needs the manual scripts/reset-sensor.sh
-4. Long-run adaptive matching threshold (Windows has it; not ported)
+4. Long-run adaptive matching threshold (Windows has it) — argued
+   **non-portable** at the current calibration on 2026-10-04 (it is
+   anti-hammering hysteresis, the opposite direction from an FRR win;
+   see windows-agc-threshold §3.3); the FRR lever is the landed
+   second-chance retry instead
 5. Upstream patch preparation (separate matcher file + protocol docs),
    targeting [libfprint upstream](https://gitlab.freedesktop.org/libfprint/libfprint)

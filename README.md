@@ -32,7 +32,14 @@
   [comparison §6](docs/comparison.md#与-windows-原版的差异)）、
   模板 v2 内嵌校准块（传感器侧读数失效时上传模板内副本瞬时恢复，见
   [protocol §8 第 3 条](docs/protocol.md#8-已知陷阱全部真机验证2026-09-1213)；
-  **建议重录指纹获得 v2 模板**，v1 模板仍可正常验证）
+  **建议重录指纹获得 v2 模板**，v1 模板仍可正常验证）、
+  验证低票二次机会（默认开：best 过线而 agree 不足时加倍容差重匹配
+  一次，离线回放救回 1 个真手指运行、冒充零翻转，见
+  [windows-agc-threshold §4.1](docs/windows-agc-threshold.md)）、
+  逐帧 AGC 强度闭环（实验性默认关，`EGIS0575_AGC=1` 启用；验证阈值
+  自适应经复核论证不可移植、不做，同文档 §3.3）、**停用 EH575 的 USB
+  自动挂起**（2026-10-11 固件假死事故修复：包 hwdb 不再为 0575 标记
+  ID_AUTOSUSPEND；恢复方法与主机侧额外防护见下方故障排除）
 - **待办**：扩样本调优阈值、多机型反馈、上游化补丁
 
 ## 文档导航
@@ -115,9 +122,37 @@ egis_matcher.py 的特征提取与 eval_sigfm 需 OpenCV，hwpoll 另需 pyusb�
   保留——写 `/etc/systemd/system/fprintd.service.d/keepalive.conf`：
   `[Service]` 段下先 `ExecStart=`（置空）再 `ExecStart=/usr/lib/fprintd -t`，
   然后 `systemctl daemon-reload`；代价是传感器 24h 低速轮询，由健康看门狗兜底）
+- `EGIS0575_SECOND_CHANCE=0` — 关闭验证低票二次机会（默认开：best 分过线
+  但 agree 帧不足时，用加倍几何容差重匹配一次再判——Windows 引擎尾部的
+  旋转补偿救援路径移植；FAR 侧被不变的 best 阈值封顶，离线回放 36 运行
+  救回 1 个真手指运行、冒充零翻转）
+- `EGIS0575_AGC=1` — 启用逐帧 AGC 强度闭环（默认关，实验性：
+  `et5xx_fetch_dynamic_intensity` 移植，见
+  [windows-agc-threshold.md](docs/windows-agc-threshold.md)。遥测字节搭
+  采集表内既有包的便车，健康传感器读数 mid-range 时零额外流量；仅在
+  读数钉死在 rail 时读 `60 12` 并写 `61 0f`/`61 12` 调档）
+- `EGIS0575_AGC_71=1` — AGC 开启时额外把实测字节写进 `71` 检测参数块
+  第 5 字节（默认关：实机 b0 读数 ~0x7f 与 pcap 实证的 0xb9/0xbe 不符，
+  溯源未定，静态 0xb9 是已验证值）
 - `EGIS0575_DEBUG_MAX_FILES` — PGM/原始帧转储的文件数上限（默认 5000，
   约 26 MB 原始帧；所有调试转储均为 0600 权限、目录 0700，因其含
   生物特征数据）
+
+## 故障排除
+
+- **指纹传感器从 USB 总线消失（lsusb 找不到）/ 指纹完全无响应**：
+  固件挂起-唤醒路径脆弱的已知事故形态（2026-10-11 实证，见
+  [protocol §8 第 7 条](docs/protocol.md)）。恢复 = **彻底冷启动**：
+  关机 → 拔掉电源适配器 → 长按电源键 15–30 秒放电 → 开机
+  （普通重启无效，热重启不切 USB 供电）。枚举失败风暴期间同一 xHCI
+  控制器上的其他 USB 设备（如罗技接收器）可能跟着失灵，冷启动后同愈。
+  复发防护自 v0.2.3-3 起内置（本包不再为 0575 标记 ID_AUTOSUSPEND）；
+  另建议主机侧加 TLP `USB_DENYLIST="1c7a:0575"`（装了 TLP 的话，
+  /etc/tlp.d/*.conf）与 /etc/udev/hwdb.d/ 覆盖条目（应对 systemd ≥262
+  自带 hwdb 的同标记，本仓库 `scripts/` 暂无一键脚本，见 protocol §8
+  第 7 条的四层防护清单）。
+- **传输挂死/超时风暴**：`./scripts/reset-sensor.sh`（USBDEVFS_RESET，
+  无需 root）。
 
 ## 目录结构
 

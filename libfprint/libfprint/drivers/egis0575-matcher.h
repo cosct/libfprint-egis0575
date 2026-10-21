@@ -60,6 +60,19 @@
 #define EGIS0575_M_AGREE_SCORE 150
 #define EGIS0575_M_AGREE_FRAMES 2
 
+/* Second-chance retry (Windows engine tail of FUN_1800067c0: a probe whose
+ * score clears the threshold but whose consistent-pair count falls short
+ * gets one rotation-compensated re-match before failing — the off-angle
+ * press case). Our analogue re-scores the gallery with doubled geometric
+ * tolerances and lets that pass count towards the agree floor; the best
+ * score itself still comes from the strict pass, so the FAR side is bounded
+ * by the unchanged MATCH_THRESHOLD. Offline replay on the 36-runnable
+ * corpus (2026-10-04, tools/egis0575-feedback-eval): rescued one genuine
+ * run (best 403 failing on agree) with zero impostor flips.
+ * EGIS0575_SECOND_CHANCE=0 disables. */
+#define EGIS0575_M_SC_POS_TOL_PX 12
+#define EGIS0575_M_SC_ANGLE_TOL_DEG 24.0
+
 typedef struct
 {
   uint16_t x, y;
@@ -83,3 +96,12 @@ void egis0575_m_extract (const uint8_t *img, int w, int h,
 int egis0575_m_score (const Egis0575MFeatureSet *probe,
                       const Egis0575MFeatureSet *gallery,
                       int *votes_out);
+
+/* Same scoring with caller-supplied geometric tolerances (the strict
+ * wrapper above uses EGIS0575_M_POS_TOL_PX / _ANGLE_TOL_DEG; the
+ * second-chance retry uses the wider EGIS0575_M_SC_* pair). */
+int egis0575_m_score_ex (const Egis0575MFeatureSet *probe,
+                         const Egis0575MFeatureSet *gallery,
+                         int    *votes_out,
+                         int     pos_tol_px,
+                         double  angle_tol_deg);

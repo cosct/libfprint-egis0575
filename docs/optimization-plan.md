@@ -1,5 +1,24 @@
 # 优化计划（基于 2026-09-13 逆向结果）
 
+> **状态 2026-10-12**：**停用 EH575 的 USB runtime autosuspend**——
+> 2026-10-11 生产事故（闲置 1.5h 唤醒失败 → 固件假死、枚举风暴拖死同
+> xHCI 控制器上的其他设备、唯彻底冷启动可恢复）。包级修复：EH575 进入
+> `fprint-list-udev-hwdb.c` denylist（v0.2.3-3）；主机侧三层兜底见
+> protocol §8 第 7 条。教训：此类枚举级故障发生在 libusb open 之前，
+> 驱动协议层无法拦截，修法在电源管理层。
+>
+> **状态 2026-10-04**：新增落地（本轮，master 未发布）——
+> **验证低票二次机会**（默认开，`EGIS0575_SECOND_CHANCE=0` 关：best 过线
+> 而 agree 不足时加倍容差重匹配一次；离线 36 运行救回 1 个真手指运行、
+> 冒充零翻转，见 windows-agc-threshold §4.1）与
+> **逐帧 AGC 强度闭环**（`EGIS0575_AGC=1` 启用、默认关：Windows
+> et5xx_fetch_dynamic_intensity 移植，遥测搭采集表既有包便车、健康传感器
+> 零额外流量，rail 条件才写 61 0f/61 12；真机 20s+15min soak 验证
+> mid-range 稳定零写入，见 windows-agc-threshold §2.4）。71 包字节动态化
+> 拆为 `EGIS0575_AGC_71`（默认关，溯源未定）。**阈值自适应论证为当前
+> 标定下不可移植（不做）**——机制实为防锤击滞回，方向与 FRR 相反，
+> 见 windows-agc-threshold §3.3。
+>
 > **状态 2026-09-14**：P2-D ✅、P1-B ✅（标定报告
 > docs/enroll-sim-calibration.txt，阈值 650 落地）、P1-A ✅（缓存生命周期
 > 补全）、P2-C ✅（真机已验证 0.25s→0.52s 降档）。新增落地（master 未发布，

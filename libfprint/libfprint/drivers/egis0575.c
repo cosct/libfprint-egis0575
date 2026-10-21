@@ -127,6 +127,28 @@ struct _FpDeviceEgis0575
   gboolean      verify_feedback;      /* EGIS0575_VERIFY_FEEDBACK=0 disables */
   GPtrArray    *feedback_cache;       /* Egis0575FeedbackEntry*, survives close like the calibration cache */
 
+  gboolean      second_chance;        /* EGIS0575_SECOND_CHANCE=0 disables the relaxed agree retry */
+
+  /* Per-frame AGC (port of the Windows et5xx_fetch_dynamic_intensity loop,
+   * docs/windows-agc-threshold.md §2; EGIS0575_AGC=1 enables, default off
+   * pending live verification). The measurement rides packets already in
+   * the capture tables: the `62 67 03` block read returns 3 telemetry
+   * bytes and the `60 0f` single read the sensor's current intensity
+   * level, so the common case costs zero extra transfers. Adjustments only
+   * run when the reading is pinned at a rail (the DLL's own condition) and
+   * issue at most one `60 12` read plus one `61 0f`/`61 12` write. */
+  gboolean      agc_enabled;
+  gboolean      agc_patch_71;      /* EGIS0575_AGC_71=1: feed the measured byte into the 71 block */
+  guint8        agc_b0, agc_b1;      /* last `62 67 03` telemetry pair */
+  gboolean      agc_meas_fresh;      /* b0/b1 seen this cycle */
+  guint8        agc_level;           /* last `60 0f` readback */
+  gboolean      agc_level_valid;
+  gboolean      agc_pending;         /* rail condition seen; act at SM_INIT */
+  gint          agc_mode;            /* AGC_RAISE / AGC_LOWER / AGC_DECR_ROW */
+  guint8        agc_write_seq[7];    /* pending `61 aa vv` built by the walk */
+  Packet        shutdown_packets[EGIS0575_SHUTDOWN_PACKETS_LENGTH];  /* mutable copy: byte 5 of the 71 block tracks the measured intensity */
+  guint8        shutdown_seqs[EGIS0575_SHUTDOWN_PACKETS_LENGTH][18];
+
   guint         startup_timeout_retries;
   guint         timeout_recoveries;   /* consecutive timeout restarts; any successful
                                        * transfer callback resets it */
@@ -146,8 +168,8 @@ struct _FpDeviceEgis0575
  * entering state N"); this table is the legend: 0=CAL_START, 1=CAL_PHASE_1,
  * 2/3=CAL_POLL_2, 4=CAL_PHASE_3, 5/6=CAL_POLL_4, 7=CAL_PHASE_5, 8/9=CAL_READ,
  * 10=CAL_CHECK, 11=PRE_RESET, 12/13=RESET_POLL, 14=POST_RESET, 15=CAL_ENTER,
- * 16=CAL_WRITE, 17=CAL_ACK, 18=INIT, 19=START, 20/21=REQ/RESP, 22=DONE,
- * 23=SHUTDOWN, 24=FINISH. */
+ * 16=CAL_WRITE, 17=CAL_ACK, 18=INIT, 19..22=AGC_REQ/RESP/WRITE/ACK,
+ * 23=START, 24/25=REQ/RESP, 26=DONE, 27=SHUTDOWN, 28=FINISH. */
 enum sm_states {
   SM_CAL_START,
   SM_CAL_PHASE_1,
@@ -168,6 +190,10 @@ enum sm_states {
   SM_CAL_WRITE,
   SM_CAL_ACK,
   SM_INIT,
+  SM_AGC_REQ,
+  SM_AGC_RESP,
+  SM_AGC_WRITE,
+  SM_AGC_ACK,
   SM_START,
   SM_REQ,
   SM_RESP,
@@ -175,6 +201,14 @@ enum sm_states {
   SM_SHUTDOWN,
   SM_FINISH,
   SM_STATES_NUM
+};
+
+/* AGC walk modes (branch structure copied from the DLL's
+ * et5xx_fetch_dynamic_intensity; see the table comment below). */
+enum agc_modes {
+  AGC_RAISE,     /* b0 == 0: too dark -> raise the intensity level (cap 0x40) */
+  AGC_LOWER,     /* b1 == 0xff: too bright -> lower the level (floor 0) */
+  AGC_DECR_ROW,  /* b0 == 0 && b1 == 0xff: step the table-row register 0x12 down */
 };
 
 /* Child state machine that walks a static Packet array (calibration phases). */
@@ -187,6 +221,17 @@ enum packet_ssm_states {
 
 G_DECLARE_FINAL_TYPE (FpDeviceEgis0575, fpi_device_egis0575, FPI, DEVICE_EGIS0575, FpDevice);
 G_DEFINE_TYPE (FpDeviceEgis0575, fpi_device_egis0575, FP_TYPE_DEVICE);
+
+/* 16-level cumulative intensity table, extracted from
+ * EgisTouchFP0575.dll v3.7.1.1 .rdata RVA 0x3dc10 (identical in the 2021
+ * build where it sits as stack immediates in et5xx_fetch_dynamic_intensity).
+ * The row in force is selected by register 0x12; the walk subtracts
+ * table[k] from the scaled measurement per level step (see
+ * docs/windows-agc-threshold.md §2). */
+static const guint32 agc_intensity_table[16] = {
+  0x0800, 0x395c, 0x42e1, 0x4c66, 0x508f, 0x5f33, 0x68cd, 0x7266,
+  0x7c00, 0x859a, 0x8e66, 0x9800, 0xa19a, 0xab33, 0xb4cd, 0xbe66,
+};
 
 /* Multi-frame verify: collect up to this many quality-gated frames within one
  * touch turn and match the best one. */
@@ -250,6 +295,8 @@ static gboolean recycle_interface_claim (FpDevice *dev, const char *reason, GErr
 static void cancel_watchdog_cb (FpDevice *dev, gpointer user_data);
 static void capture_transfer_submit (FpDeviceEgis0575 *self, FpiUsbTransfer *transfer,
                                      FpDevice *dev, FpiUsbTransferCallback callback);
+static void agc_parse_response (FpDeviceEgis0575 *self, const Packet *pkt,
+                                FpiUsbTransfer *transfer);
 
 /* Watchdog check + full recovery path. Called from the idle (no-finger)
  * branch of save_img with the raw frame available. */
@@ -603,11 +650,17 @@ unpack_feature_frames (GVariant             *data,
 
 /* Verify verdict (see https://github.com/cosct/fprintdriver/blob/master/docs/windows-engine-tables.md): a probe matches when its
  * best gallery score clears the threshold AND at least two gallery frames
- * agree above the agree floor. */
+ * agree above the agree floor. The Windows-engine second chance
+ * (FUN_1800067c0 tail, docs/windows-agc-threshold.md §4): a probe whose
+ * best score clears the threshold but whose agree count falls short gets
+ * one re-match with doubled geometric tolerances before failing — the
+ * off-angle press case. The best score itself stays from the strict pass,
+ * so the FAR side is bounded by the unchanged threshold. */
 static gboolean
 probe_matches_gallery (const Egis0575MFeatureSet *probe,
                        const Egis0575MFeatureSet *gallery,
                        guint                     gallery_n,
+                       gboolean                  allow_second_chance,
                        int                      *best_out)
 {
   int best = 0;
@@ -621,6 +674,25 @@ probe_matches_gallery (const Egis0575MFeatureSet *probe,
         best = s;
       if (s >= EGIS0575_M_AGREE_SCORE)
         agree++;
+    }
+
+  if (allow_second_chance &&
+      best >= EGIS0575_M_MATCH_THRESHOLD && agree < EGIS0575_M_AGREE_FRAMES)
+    {
+      guint relaxed = 0;
+
+      for (guint g = 0; g < gallery_n; g++)
+        if (egis0575_m_score_ex (probe, &gallery[g], NULL,
+                                 EGIS0575_M_SC_POS_TOL_PX,
+                                 EGIS0575_M_SC_ANGLE_TOL_DEG) >= EGIS0575_M_AGREE_SCORE)
+          relaxed++;
+
+      if (relaxed >= EGIS0575_M_AGREE_FRAMES)
+        {
+          fp_info ("Second chance: agree %u -> %u with relaxed tolerances (best %d)",
+                   agree, relaxed, best);
+          agree = relaxed;
+        }
     }
 
   if (best_out)
@@ -1763,7 +1835,7 @@ finalize_verify (FpDeviceEgis0575 *self, FpiSsm *ssm, FpDevice *dev)
       int best = 0;
 
       if (probe_matches_gallery (probe, self->verify_gallery,
-                                 self->verify_gallery_n, &best))
+                                 self->verify_gallery_n, self->second_chance, &best))
         match = TRUE;
       if (best > best_overall)
         {
@@ -2206,7 +2278,7 @@ save_img (FpiUsbTransfer *transfer, FpDevice *dev)
                * further collection — keeps a successful press under ~2s. */
               if (self->verify_gallery &&
                   probe_matches_gallery (fs, self->verify_gallery,
-                                         self->verify_gallery_n, NULL))
+                                         self->verify_gallery_n, self->second_chance, NULL))
                 {
                   fp_info ("Verify probe %u already matches; finalizing early",
                            self->verify_probes->len);
@@ -2342,6 +2414,10 @@ resp_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *er
           transfer->actual_length > 4 ? transfer->buffer[4] : 0,
           transfer->actual_length > 5 ? transfer->buffer[5] : 0,
           transfer->actual_length > 6 ? transfer->buffer[6] : 0);
+
+  /* AGC telemetry rides the `62 67 03` / `60 0f` packets already in the
+   * table; the parse is a no-op unless EGIS0575_AGC=1. */
+  agc_parse_response (self, &self->pkt_array[self->current_index], transfer);
 
   if (self->current_index == self->pkt_array_len - 1)
     {
@@ -2743,6 +2819,202 @@ cal_status_poll_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data,
 }
 
 /*
+ * ==================== AGC (et5xx_fetch_dynamic_intensity port) ====================
+ */
+
+/* Telemetry parse, called from resp_cb for packets already in the capture
+ * tables. The `62 67 03` block read returns 10 bytes: the 7-byte header
+ * plus 3 measurement bytes (b0 = bright measure, b1 = inverted dark
+ * measure, semantics per the DLL); the `60 0f 03` single read returns the
+ * sensor's current intensity level in resp[5]. When a fresh level lands
+ * after a fresh measurement, evaluate the rail condition (the DLL's own
+ * branch structure) and arm the adjustment for SM_INIT. Byte 5 of the
+ * detect-mode `71` block (shutdown tail) tracks the measurement, replacing
+ * the compiled-in 0xb9 the way the Windows loop feeds its context value. */
+static void
+agc_parse_response (FpDeviceEgis0575 *self, const Packet *pkt, FpiUsbTransfer *transfer)
+{
+  if (!self->agc_enabled || transfer->actual_length < 7)
+    return;
+
+  if (pkt->length >= 6 && pkt->sequence[4] == 0x62 && pkt->sequence[5] == 0x67 &&
+      transfer->actual_length >= 10)
+    {
+      self->agc_b0 = transfer->buffer[7];
+      self->agc_b1 = transfer->buffer[8];
+      self->agc_meas_fresh = TRUE;
+      /* The 71-block byte 5 provenance is unresolved (live b0 reads ~0x7f
+       * on a healthy sensor while the pcap-proven value is 0xb9/0xbe), so
+       * the patch is a separate opt-in; the compiled-in 0xb9 stays the
+       * default. */
+      if (self->agc_patch_71)
+        self->shutdown_packets[EGIS0575_SHUTDOWN_PACKETS_LENGTH - 1].sequence[8] = self->agc_b0;
+    }
+  else if (pkt->length >= 6 && pkt->sequence[4] == 0x60 && pkt->sequence[5] == 0x0f)
+    {
+      self->agc_level = transfer->buffer[5];
+      self->agc_level_valid = TRUE;
+    }
+  else
+    {
+      return;
+    }
+
+  fp_dbg ("AGC: b0=%02x b1=%02x level=%02x", self->agc_b0, self->agc_b1,
+          self->agc_level_valid ? self->agc_level : 0);
+
+  if (!self->agc_meas_fresh || !self->agc_level_valid)
+    return;
+  self->agc_meas_fresh = FALSE;   /* one decision per measurement */
+
+  /* Rail conditions only — the DLL adjusts nothing while the reading sits
+   * mid-range, which keeps the common-case cost of this port at zero. */
+  if (self->agc_b0 == 0 && self->agc_b1 == 0xff)
+    self->agc_mode = AGC_DECR_ROW;
+  else if (self->agc_b1 == 0xff)
+    self->agc_mode = AGC_LOWER;
+  else if (self->agc_b0 == 0)
+    self->agc_mode = AGC_RAISE;
+  else
+    return;
+
+  fp_dbg ("AGC: rail condition (mode %d); adjustment queued", self->agc_mode);
+  self->agc_pending = TRUE;
+}
+
+static const guint8 agc_row_read_seq[7] = {0x45, 0x47, 0x49, 0x53, 0x60, 0x12, 0x00};
+
+/* Send-side counterpart of the read callbacks' degrade rule: a failed AGC
+ * transfer skips the adjustment and returns to the capture loop instead of
+ * failing the action — the feature is auxiliary. */
+static void
+agc_send_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
+{
+  if (error)
+    {
+      fp_dbg ("AGC: transfer failed (%s); skipping adjustment", error->message);
+      g_error_free (error);
+      fpi_ssm_jump_to_state (transfer->ssm, SM_INIT);
+      return;
+    }
+  fpi_ssm_next_state (transfer->ssm);
+}
+
+/* Response to the `60 12` table-row read: run the walk (scaled measurement
+ * vs the 16-level table, row selected by register 0x12) and either queue
+ * the `61` write or fall straight back to the capture loop. AGC failures
+ * degrade to "skip this adjustment" instead of failing the action — the
+ * feature is auxiliary and the main loop's own recovery paths own wedge
+ * handling. */
+static void
+agc_12_read_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
+{
+  FpDeviceEgis0575 *self = FPI_DEVICE_EGIS0575 (dev);
+  guint8 seq[7] = {0x45, 0x47, 0x49, 0x53, 0x61, 0, 0};
+  guint k, level;
+  guint32 x;
+
+  if (error)
+    {
+      fp_dbg ("AGC: row read failed (%s); continuing without adjustment", error->message);
+      g_error_free (error);
+      fpi_ssm_jump_to_state (transfer->ssm, SM_INIT);
+      return;
+    }
+
+  if (self->stop)
+    {
+      fpi_ssm_jump_to_state (transfer->ssm, SM_DONE);
+      return;
+    }
+
+  if (transfer->actual_length < 7)
+    {
+      fp_dbg ("AGC: short row response; skipping adjustment");
+      fpi_ssm_jump_to_state (transfer->ssm, SM_INIT);
+      return;
+    }
+
+  if (!self->agc_level_valid)
+    {
+      /* No 60 0f readback seen yet (or a stale pending): nothing to walk. */
+      fpi_ssm_jump_to_state (transfer->ssm, SM_INIT);
+      return;
+    }
+
+  k = transfer->buffer[5];
+  if (k >= G_N_ELEMENTS (agc_intensity_table))
+    k = G_N_ELEMENTS (agc_intensity_table) - 1;
+  level = self->agc_level;
+
+  switch (self->agc_mode)
+    {
+    case AGC_DECR_ROW:
+      if (k <= 1)
+        {
+          fp_dbg ("AGC: row register already at 1; nothing to do");
+          fpi_ssm_jump_to_state (transfer->ssm, SM_INIT);
+          return;
+        }
+      seq[5] = 0x12;
+      seq[6] = (guint8) (k - 1);
+      break;
+
+    case AGC_LOWER:
+      x = (guint32) self->agc_b0 << 10;
+      while (level > 0 && x >= agc_intensity_table[k])
+        {
+          x -= agc_intensity_table[k];
+          level--;
+        }
+      if (level == self->agc_level)
+        {
+          fp_dbg ("AGC: lower walk converged without a level change");
+          fpi_ssm_jump_to_state (transfer->ssm, SM_INIT);
+          return;
+        }
+      seq[5] = 0x0f;
+      seq[6] = (guint8) level;
+      break;
+
+    case AGC_RAISE:
+    default:
+      x = (guint32) (0xff - self->agc_b1) << 10;
+      while (level < 0x40 && x >= agc_intensity_table[k])
+        {
+          x -= agc_intensity_table[k];
+          level++;
+        }
+      if (level == self->agc_level)
+        {
+          fp_dbg ("AGC: raise walk converged without a level change");
+          fpi_ssm_jump_to_state (transfer->ssm, SM_INIT);
+          return;
+        }
+      seq[5] = 0x0f;
+      seq[6] = (guint8) level;
+      break;
+    }
+
+  memcpy (self->agc_write_seq, seq, sizeof (seq));
+  self->agc_level = (guint8) level;
+  fp_info ("AGC: writing 61 %02x %02x (mode %d, row %u)", seq[5], seq[6],
+           self->agc_mode, k);
+  fpi_ssm_next_state (transfer->ssm);   /* -> SM_AGC_WRITE */
+}
+
+static void
+agc_ack_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
+{
+  if (error)
+    {
+      fp_dbg ("AGC: adjustment ack failed (%s); continuing", error->message);
+      g_error_free (error);
+    }
+  fpi_ssm_jump_to_state (transfer->ssm, SM_INIT);
+}
+
+/*
  * ==================== SSM loopback ====================
  */
 
@@ -2990,6 +3262,17 @@ ssm_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case SM_INIT:
+      /* A rail condition was seen in the previous cycle's telemetry: run
+       * the adjustment before arming the next capture cycle. The pending
+       * flag is consumed here so the AGC chain always falls back to
+       * SM_INIT exactly once. */
+      if (self->agc_enabled && self->agc_pending)
+        {
+          self->agc_pending = FALSE;
+          fp_dbg ("Running AGC adjustment before next capture cycle");
+          fpi_ssm_next_state (ssm);   /* -> SM_AGC_REQ */
+          break;
+        }
       fp_dbg ("Starting capture");
       if (!self->cal_skip)
         {
@@ -3030,8 +3313,26 @@ ssm_run_state (FpiSsm *ssm, FpDevice *dev)
         }
       else
         {
-          fpi_ssm_next_state (ssm);
+          /* Jump explicitly: SM_AGC_* sits between SM_INIT and SM_START,
+           * so next_state would fall into the AGC chain. */
+          fpi_ssm_jump_to_state (ssm, SM_START);
         }
+      break;
+
+    case SM_AGC_REQ:
+      cal_send (ssm, dev, agc_row_read_seq, 7, agc_send_cb);
+      break;
+
+    case SM_AGC_RESP:
+      cal_read (ssm, dev, 7, agc_12_read_cb);
+      break;
+
+    case SM_AGC_WRITE:
+      cal_send (ssm, dev, self->agc_write_seq, 7, agc_send_cb);
+      break;
+
+    case SM_AGC_ACK:
+      cal_read (ssm, dev, 7, agc_ack_cb);
       break;
 
     case SM_START:
@@ -3068,7 +3369,10 @@ ssm_run_state (FpiSsm *ssm, FpDevice *dev)
 
     case SM_DONE:
       fp_dbg ("Capture loop stopping; shutting sensor down");
-      self->cal_pkt_array = EGIS0575_SHUTDOWN_PACKETS;
+      /* Mutable per-device copy: with the AGC enabled its last packet's
+       * intensity byte carries the measured value instead of the static
+       * 0xb9 (agc_parse_response keeps it fresh). */
+      self->cal_pkt_array = self->shutdown_packets;
       self->cal_pkt_len = EGIS0575_SHUTDOWN_PACKETS_LENGTH;
       self->cal_pkt_index = 0;
       fpi_ssm_start_subsm (ssm,
@@ -3168,6 +3472,8 @@ reset_action_state (FpDeviceEgis0575 *self)
   self->cal_poll_iters = 0;
   self->cal_read_recoveries = 0;
   self->cal_recovery_adopted = FALSE;
+  self->agc_pending = FALSE;
+  self->agc_meas_fresh = FALSE;
   self->weak_press_events = 0;
   self->weak_press_window_start = 0;
   self->background_warmup_remaining = EGIS0575_BACKGROUND_WARMUP_FRAMES;
@@ -3616,6 +3922,24 @@ fpi_device_egis0575_init (FpDeviceEgis0575 *self)
     }
 
   self->verify_feedback = (g_strcmp0 (g_getenv ("EGIS0575_VERIFY_FEEDBACK"), "0") != 0);
+  self->second_chance = (g_strcmp0 (g_getenv ("EGIS0575_SECOND_CHANCE"), "0") != 0);
+  /* Off by default until live-verified on more units: the rail-condition
+   * gating keeps the common case inert, but the `61 0f`/`61 12` writes and
+   * the measured 71-block byte are new traffic whose sensor-side effect is
+   * only black-box understood (docs/windows-agc-threshold.md §2.4). */
+  self->agc_enabled = (g_strcmp0 (g_getenv ("EGIS0575_AGC"), "1") == 0);
+  self->agc_patch_71 = (g_strcmp0 (g_getenv ("EGIS0575_AGC_71"), "1") == 0);
+
+  /* Per-device mutable copy of the shutdown array so the AGC can patch the
+   * 71-block intensity byte; with the AGC off the copy is byte-identical
+   * to the static table. */
+  for (guint i = 0; i < EGIS0575_SHUTDOWN_PACKETS_LENGTH; i++)
+    {
+      self->shutdown_packets[i] = EGIS0575_SHUTDOWN_PACKETS[i];
+      self->shutdown_packets[i].sequence = self->shutdown_seqs[i];
+      memcpy (self->shutdown_seqs[i], EGIS0575_SHUTDOWN_PACKETS[i].sequence,
+              EGIS0575_SHUTDOWN_PACKETS[i].length);
+    }
 
   self->padded_img_width = ((self->active_width + 3) / 4) * 4;
 }

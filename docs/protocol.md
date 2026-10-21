@@ -31,7 +31,9 @@ championswimmer EH577 工程（2026-06 最新）、python-egistec-eh575（独立
   - `71 …` — **检测模式参数块**：`71 45 06 00 XX 87 13 00 03` 出现在
     AGC 寄存器写之后、`60 01` 手指轮询开始之前（对应 DLL 的
     SetDetectModeParameters；第 5 字节 XX 为 et5xx_fetch_dynamic_intensity
-    算出的动态强度值，实测同机型跨会话 0xb9/0xbe）；短块
+    算出的动态强度值，实测同机型跨会话 0xb9/0xbe——该逐帧 AGC 闭环的
+    完整算法与 16 级强度表见
+    [windows-agc-threshold.md](windows-agc-threshold.md)）；短块
     `71 02 02 01 0c` 在重武装（POST_REPEAT）路径
   - `72 hh ll` — **块读**（hh ll = 字节数大端）：`72 14 ec` 即读 5356 字节
   - `73 hh ll` — **块写**（hh ll = 字节数大端）：`73 14 ec` 即宣告将写
@@ -193,6 +195,22 @@ print 存储承担了 Windows 注册表缓存的角色，传感器侧读数失�
 6. **长连续轮询渐进失敏**：>10 分钟级连续轮询使按压 coverage 从 50% 衰减
    到 2–5%——驱动内看门狗已实现自动恢复（10 分钟预防性重初始化 +
    weak-press 检测触发校准链重跑）；硬挂死场景用 `USBDEVFS_RESET` 手动恢复
+7. **USB runtime autosuspend 可使固件死透（枚举级，驱动不可恢复）**：
+   2026-10-11 事故——设备闲置约 1.5 小时后唤醒失败：14:38:14 libusb
+   open 即 EIO，同一秒内核记录 USB disconnect，随后枚举全部 -110 超时、
+   端口 power cycle 无效、热重启无效（USB 供电不断），唯彻底冷启动
+   （关机+拔电源+长按放电）恢复；枚举错误风暴还拖死了同 xHCI 控制器上的
+   罗技接收器。根因推断（与全部观测一致，未直接取证固件内部）：EH575
+   固件的挂起/唤醒路径脆弱。挂起的三个开启源均已确认并封堵
+   （2026-10-12，四层防护）：① 本包 hwdb `usb:v1C7Ap0575*
+   ID_AUTOSUSPEND=1`（已从 `fprint-list-udev-hwdb.c` denylist 移除，
+   v0.2.3-3 起）② systemd ≥262 自带指纹 hwdb 同条目（/etc/udev/hwdb.d/
+   99-egis-no-autosuspend.hwdb 覆盖为 0）③ TLP `USB_AUTOSUSPEND=1` 默认
+   （/etc/tlp.d/99-egis-fprint.conf 加 USB_DENYLIST，TLP 会主动写
+   power/control=on）④ 兜底 /etc/udev/rules.d/90-egis-no-suspend.rules。
+   代价：传感器常通电（功耗可忽略），换固件安全。**驱动侧教训**：此类
+   故障发生在 libusb open 之前（枚举层），驱动内探活逻辑无从介入——
+   正确修法在电源管理层，不在协议层
 
 ## 9. 系统级验收（2026-09-13 00:39）
 

@@ -397,6 +397,18 @@ egis0575_m_score (const Egis0575MFeatureSet *probe,
                   const Egis0575MFeatureSet *gallery,
                   int *votes_out)
 {
+  return egis0575_m_score_ex (probe, gallery, votes_out,
+                              EGIS0575_M_POS_TOL_PX,
+                              EGIS0575_M_ANGLE_TOL_DEG);
+}
+
+int
+egis0575_m_score_ex (const Egis0575MFeatureSet *probe,
+                     const Egis0575MFeatureSet *gallery,
+                     int    *votes_out,
+                     int     pos_tol_px,
+                     double  angle_tol_deg)
+{
   int n1 = probe->n, n2 = gallery->n;
 
   if (votes_out)
@@ -457,7 +469,7 @@ egis0575_m_score (const Egis0575MFeatureSet *probe,
       double dx = (probe->f[i].x - gallery->f[best_j[i]].x) - cx;
       double dy = (probe->f[i].y - gallery->f[best_j[i]].y) - cy;
       if (best_h[i] <= EGIS0575_M_HAMMING_BUDGET &&
-          fabs (dx) <= EGIS0575_M_POS_TOL_PX && fabs (dy) <= EGIS0575_M_POS_TOL_PX)
+          fabs (dx) <= pos_tol_px && fabs (dy) <= pos_tol_px)
         inl[n_inl++] = i;
     }
   if (n_inl < EGIS0575_M_MIN_MATCHED)
@@ -491,7 +503,7 @@ egis0575_m_score (const Egis0575MFeatureSet *probe,
       if (dm < 0)
         dm += 360.0;
       double dang = dm > 360.0 - dm ? 360.0 - dm : dm;
-      if (dang <= EGIS0575_M_ANGLE_TOL_DEG)
+      if (dang <= angle_tol_deg)
         {
           score += 128 - best_h[i];
           good++;

@@ -21,6 +21,7 @@ hardware-verified or source-traceable; open items live in
 | USB 通信协议 / USB wire protocol | CET300 命令集全表、初始化/采集序列、Windows 会话实际序列与已知陷阱 / The full CET300 command set, init & capture sequences, the actual Windows session order, known pitfalls | [protocol.md](protocol.md) | [protocol.en.md](protocol.en.md) |
 | 引擎系数提取 / Coefficient extraction | 从 vendor DLL 定位并提取 FIR/权重表的完整方法 / Locating and extracting the FIR/weight tables from the vendor DLL | [windows-engine-tables.md](windows-engine-tables.md) | [windows-engine-tables.en.md](windows-engine-tables.en.md) |
 | Windows 录入机制 / Enrollment mechanics | WBF 引擎适配器的采样数三层覆盖、逐帧三道门、20 个可调参数 / The WBF engine adapter's layered sample counts, per-frame gating, 20 tunables | [windows-enrollment.md](windows-enrollment.md) | [windows-enrollment.en.md](windows-enrollment.en.md) |
+| AGC 闭环与阈值自适应 / AGC loop & adaptive threshold | 逐帧强度闭环（16 级表 + 0x0f/0x12 寄存器）、验证阈值 −80/+60 防锤击滞回与不可移植论证、model-5 参数表全量 / The per-frame intensity loop (16-level table), the −80/+60 anti-hammering threshold hysteresis and why it does not port, full model-5 parameter table | [windows-agc-threshold.md](windows-agc-threshold.md) | [windows-agc-threshold.en.md](windows-agc-threshold.en.md) |
 
 ## 板块二：驱动工程 / Track 2: Driver engineering
 

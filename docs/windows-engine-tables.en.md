@@ -110,8 +110,14 @@ agreement, naturally filtered by the dual condition.
   threshold 300 — the current threshold is 335): `probes=1
   best_score=1086/300 => MATCH`, coverage 51%
 - Not ported from the original Windows engine: the adaptive threshold-660
-  scheme (−80/+60, 1.5× cap) and verification-time template feedback
-  (encrypted registry blob 'AE', key DAT_180038248)
+  scheme — precise semantics completed 2026-10-04 (v3.7.1.1
+  `FUN_1800067c0`): effective threshold starts/floors at 735, −80 on
+  success, +60 on failure, capped at 990 (1.5×); it is anti-hammering
+  hysteresis, not a leniency drift, with a second match-context metric gate
+  (85); state persisted in the 'AE' blob (key DAT_180038248). Not portable
+  at our current score calibration (genuine margin is 14 points; argument
+  in the new doc §3.3); the in-memory template feedback is implemented. See
+  [windows-agc-threshold.en.md](windows-agc-threshold.en.md)
 
 ## 8. Remaining fidelity gaps (historical list, now optional enhancements)
 

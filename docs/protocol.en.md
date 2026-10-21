@@ -39,7 +39,9 @@ implementation).
     appears after the AGC register writes and right before the `60 01`
     finger-poll loop starts (the DLL's SetDetectModeParameters; byte 5 XX
     is a dynamic intensity value from et5xx_fetch_dynamic_intensity —
-    measured 0xb9/0xbe across sessions on the same machine); the short
+    measured 0xb9/0xbe across sessions on the same machine; the full
+    per-frame AGC loop and its 16-level intensity table are documented in
+    [windows-agc-threshold.en.md](windows-agc-threshold.en.md)); the short
     block `71 02 02 01 0c` sits on the re-arm (POST_REPEAT) path
   - `72 hh ll` — **block read** (hh ll = big-endian byte count):
     `72 14 ec` reads 5356 bytes
@@ -253,6 +255,29 @@ manual `scripts/reset-sensor.sh`.
    2–5% — the in-driver watchdog recovers automatically (10-minute
    prophylactic re-init + weak-press detection re-running the calibration
    chain); hard hangs use the manual `USBDEVFS_RESET`
+7. **USB runtime autosuspend can kill the firmware outright (enumeration
+   level, not recoverable by the driver)**: the 2026-10-11 incident — after
+   ~1.5 h idle, a wake attempt failed: libusb open returned EIO, the kernel
+   logged a USB disconnect in the same second, every re-enumeration then
+   timed out (-110), port power-cycling and warm reboots did not help (USB
+   power stays on), and only a full cold shutdown (power off + unplug the
+   charger + long-press power to drain) recovered the sensor; the
+   enumeration error storm also took down a Logitech receiver on the same
+   xHCI controller. Root cause (inferred, consistent with every observation;
+   firmware internals not directly evidenced): the EH575 firmware's
+   suspend/resume path is fragile. All three enablers were identified and
+   closed (2026-10-12, four-layer protection): ① this package's hwdb entry
+   `usb:v1C7Ap0575* ID_AUTOSUSPEND=1` (removed via the
+   `fprint-list-udev-hwdb.c` denylist, from v0.2.3-3) ② systemd ≥262's own
+   fingerprint hwdb entry (overridden to 0 by
+   /etc/udev/hwdb.d/99-egis-no-autosuspend.hwdb) ③ TLP's default
+   `USB_AUTOSUSPEND=1` (/etc/tlp.d/99-egis-fprint.conf adds
+   USB_DENYLIST; TLP then actively writes power/control=on) ④ catch-all
+   /etc/udev/rules.d/90-egis-no-suspend.rules. Cost: the sensor stays
+   powered (negligible draw) in exchange for firmware safety. **Driver-side
+   lesson**: this failure occurs before libusb open (enumeration layer), so
+   in-driver keep-alive probing cannot intercept it — the correct fix lives
+   in power management, not in the protocol layer
 
 ## 9. System-level acceptance (2026-09-13 00:39)
 

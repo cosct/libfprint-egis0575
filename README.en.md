@@ -46,7 +46,17 @@ docs/. The end goal is a driver submittable to
   and the v2 template embedding the calibration block (when the
   sensor-side read is invalidated, the template's copy is uploaded for an
   instant recovery; **re-enroll to get a v2 template** — v1 templates
-  still verify fine)
+  still verify fine), the low-votes verify second chance (default on:
+  best clears the threshold but agree falls short → one re-match with
+  doubled tolerances; offline replay rescued one genuine run with zero
+  impostor flips, see
+  [windows-agc-threshold.en.md §4.1](docs/windows-agc-threshold.en.md)),
+  and the experimental per-frame AGC intensity loop (default off,
+  `EGIS0575_AGC=1`; the adaptive verify threshold was reviewed and
+  argued non-portable — not doing it, same doc §3.3), and **USB
+  autosuspend disabled for the EH575** (2026-10-11 firmware-death fix:
+  this package no longer marks 0575 with ID_AUTOSUSPEND; recovery and
+  extra host-side protection in Troubleshooting below)
 - **Todo**: wider-sample threshold tuning, feedback from more machines,
   the upstreamable patch series
 
@@ -154,9 +164,45 @@ driver (see `LICENSE`).
   `ExecStart=/usr/lib/fprintd -t`, then `systemctl daemon-reload`; at the
   cost of continuous low-rate sensor polling, covered by the health
   watchdog)
+- `EGIS0575_SECOND_CHANCE=0` — disable the low-votes verify second
+  chance (default on: when the best score clears the threshold but the
+  agreeing gallery frames fall short, one re-match with doubled
+  geometric tolerances before failing — the port of the Windows engine's
+  rotation-compensated rescue tail; the FAR side stays capped by the
+  unchanged best-score threshold, offline replay rescued 1 genuine run
+  with zero impostor flips)
+- `EGIS0575_AGC=1` — enable the per-frame AGC intensity loop (default
+  off, experimental: port of `et5xx_fetch_dynamic_intensity`, see
+  [windows-agc-threshold.en.md](docs/windows-agc-threshold.en.md).
+  Telemetry rides packets already in the capture tables, so a healthy
+  sensor mid-range costs zero extra traffic; adjustments only run on
+  railed readings via `60 12` reads and `61 0f`/`61 12` writes)
+- `EGIS0575_AGC_71=1` — with AGC enabled, also feed the measured byte
+  into byte 5 of the `71` detect-mode block (default off: the live
+  ~0x7f reading does not match the pcap-proven 0xb9/0xbe, provenance
+  unresolved; the static 0xb9 is the verified value)
 - `EGIS0575_DEBUG_MAX_FILES` — file cap for PGM/raw-frame dumps (default
   5000, ≈26 MB of raw frames; all debug sinks are written 0600 into 0700
   dirs since they hold biometric data)
+
+## Troubleshooting
+
+- **Fingerprint sensor vanished from the USB bus (absent from lsusb) /
+  completely unresponsive**: the known failure mode of the fragile
+  suspend/resume path in the firmware (incident on 2026-10-11, see
+  [protocol §8 item 7](docs/protocol.en.md)). Recovery = **full cold
+  start**: shut down → unplug the charger → hold the power button 15–30 s
+  to drain → boot (plain reboots don't help — they never cut USB power).
+  During the enumeration error storm, other USB devices on the same xHCI
+  controller (e.g. a Logitech receiver) may die alongside it; they recover
+  with the same cold start. Recurrence protection is built in from
+  v0.2.3-3 (this package no longer marks 0575 with ID_AUTOSUSPEND);
+  additionally consider a host-side TLP `USB_DENYLIST="1c7a:0575"` (if TLP
+  is installed, /etc/tlp.d/*.conf) and an /etc/udev/hwdb.d/ override
+  (systemd ≥262's own fingerprint hwdb carries the same marking — the
+  four-layer list is in protocol §8 item 7).
+- **Transport wedge / timeout storms**: `./scripts/reset-sensor.sh`
+  (USBDEVFS_RESET, no root needed).
 
 ## Repository layout
 

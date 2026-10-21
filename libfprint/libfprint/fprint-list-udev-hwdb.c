@@ -208,6 +208,14 @@ static const FpIdEntry denylist_id_table[] = {
   { .vid = 0x0483, .pid = 0x2016 },
   /* https://bugs.freedesktop.org/show_bug.cgi?id=66659 */
   { .vid = 0x045e, .pid = 0x00bb },
+  /* EgisTec EH575 (egis0575): the firmware does not survive USB runtime
+   * suspend/resume — observed 2026-10-11 on a production machine: after
+   * ~1.5 h autosuspended, a wake attempt crashed the firmware off the bus
+   * and even port power-cycling could not re-enumerate it (recovery needs
+   * a full cold shutdown with the charger unplugged). Fingerprint sensors
+   * are polled by fprintd anyway; the autosuspend power saving is not
+   * worth the firmware risk. */
+  { .vid = 0x1c7a, .pid = 0x0575 },
   { .vid = 0 },
 };
 

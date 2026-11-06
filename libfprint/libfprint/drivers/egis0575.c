@@ -67,7 +67,7 @@
  * same-press pairs p10=1889 vs same-finger cross-press max=642 — near-total
  * separation; 650 sits just above the cross-press maximum (0% misreject).
  * EGIS0575_ENROLL_SIM_THRESHOLD overrides (0 disables). */
-#define EGIS0575_ENROLL_SIM_THRESHOLD_DEFAULT 650
+#define EGIS0575_ENROLL_SIM_THRESHOLD_DEFAULT 2400
 #define EGIS0575_ENROLL_SIM_MAX_REJECTS 4      /* bail-out: always accept after this many consecutive rejects (the Windows engine's MAX_ENROLL_TRY analogue, keeps enrollment finishable) */
 
 /* Struct to share data across lifecycle */
@@ -172,6 +172,9 @@ struct _FpDeviceEgis0575
  * 23=START, 24/25=REQ/RESP, 26=DONE, 27=SHUTDOWN, 28=FINISH. */
 enum sm_states {
   SM_CAL_START,
+  SM_PRE_CAL_RESET,
+  SM_PRE_CAL_RESET_POLL_REQ,
+  SM_PRE_CAL_RESET_POLL_RESP,
   SM_CAL_PHASE_1,
   SM_CAL_POLL_2_REQ,
   SM_CAL_POLL_2_RESP,
@@ -257,10 +260,10 @@ static const guint32 agc_intensity_table[16] = {
  * (last_finger_activity_ms is re-armed by both): a lockscreen left waiting
  * for minutes falls back to the idle tiers instead of sustaining the
  * elevated bus load. */
-#define EGIS0575_ACTIVE_FRAME_DELAY_MS 120
+#define EGIS0575_ACTIVE_FRAME_DELAY_MS 50
 #define EGIS0575_ACTIVE_FAST_WINDOW_MS 15000
-#define EGIS0575_IDLE_FRAME_DELAY_MS 230
-#define EGIS0575_IDLE_FRAME_DELAY_DEEP_MS 500
+#define EGIS0575_IDLE_FRAME_DELAY_MS 50
+#define EGIS0575_IDLE_FRAME_DELAY_DEEP_MS 150
 #define EGIS0575_IDLE_DEEP_AFTER_MS 30000
 
 /* Sensor-health watchdog. Long continuous polling sessions degrade the
@@ -284,7 +287,7 @@ static const guint32 agc_intensity_table[16] = {
  * pre-init packet times out. If still stuck after that, fail cleanly. */
 #define EGIS0575_STARTUP_TIMEOUT_RECOVERY_MAX        2
 #define EGIS0575_STARTUP_TIMEOUT_RECOVERY_DELAY_MS 250
-#define EGIS0575_STARTUP_SETTLE_DELAY_MS           150
+#define EGIS0575_STARTUP_SETTLE_DELAY_MS            40
 
 static gboolean sensor_health_watchdog (FpDeviceEgis0575 *self, FpiUsbTransfer *transfer,
                                         FpiSsm *ssm, FpDevice *dev);
@@ -365,14 +368,14 @@ sensor_health_watchdog (FpDeviceEgis0575 *self, FpiUsbTransfer *transfer, FpiSsm
  * TURN_TIMEOUT_MS the turn fails and the driver waits for a real lift
  * before arming a new attempt. EGIS0575_FINGER_SETTLE_MS overrides the
  * settle for A/B experiments. */
-#define EGIS0575_FINGER_SETTLE_MS_DEFAULT         250
+#define EGIS0575_FINGER_SETTLE_MS_DEFAULT           0
 #define EGIS0575_TURN_TIMEOUT_MS                  1400
 
 /* Startup: grab this many valid (non-zero) idle frames as the warm background
  * before arming finger detection. Without a baseline, finger_detected compares
  * against bg=0 and the sensor's hot idle frame reads as a finger, deadlocking
  * detection. The capture workflow guarantees no finger is present at startup. */
-#define EGIS0575_BACKGROUND_WARMUP_FRAMES            3
+#define EGIS0575_BACKGROUND_WARMUP_FRAMES            1
 
 /* Background refresh gate: idle frames have a narrow pixel spread (std < 10,
  * measured max 9.9) while finger frames are strongly structured (std >= 10.1,
@@ -2040,13 +2043,10 @@ save_img (FpiUsbTransfer *transfer, FpDevice *dev)
    * detection until this completes. */
   if (self->background_warmup_remaining > 0)
     {
+      double f_std = has_valid_data ? frame_pixel_std (transfer) : 0.0;
+
       if (has_valid_data)
         {
-          /* Adopted-calibration recovery self-check: imaging after the
-           * embedded-block upload must produce structured frames. A uniform
-           * frame (e.g. the all-0xFF failure observed 2026-09-15) means the
-           * adoption failed — discard it and fall back to patient re-reads
-           * instead of hanging the action on a dead sensor pipeline. */
           if (self->cal_recovery_adopted)
             {
               if (frame_is_uniform (transfer))
@@ -2063,17 +2063,34 @@ save_img (FpiUsbTransfer *transfer, FpDevice *dev)
               fp_info ("Adopted calibration produces structured frames; recovery complete");
               self->cal_recovery_adopted = FALSE;
             }
+        }
+
+      if (has_valid_data && f_std < EGIS0575_BG_UPDATE_MAX_STD)
+        {
           update_warm_background (self, transfer);
           self->background_warmup_remaining--;
+          if (self->background_warmup_remaining == 0)
+            self->capture_armed = TRUE;
           fp_dbg ("Background warmup: grabbed idle baseline (%u frame(s) left)",
                   self->background_warmup_remaining);
+          restart_for_next_poll (self, ssm, dev, "background warmup");
+          return;
+        }
+      else if (has_valid_data && f_std >= 14.0)
+        {
+          /* Finger is already on the sensor at startup: arm immediately and
+           * evaluate this frame without corrupting the background baseline. */
+          self->background_warmup_remaining = 0;
+          self->capture_armed = TRUE;
+          fp_dbg ("Background warmup: finger already present (std=%.1f), arming immediately",
+                  f_std);
         }
       else
         {
-          fp_dbg ("Background warmup: skipping cold/zero frame");
+          fp_dbg ("Background warmup: skipping cold/zero or non-flat frame");
+          restart_for_next_poll (self, ssm, dev, "background warmup");
+          return;
         }
-      restart_for_next_poll (self, ssm, dev, "background warmup");
-      return;
     }
 
   if (pgm_debug_enabled ())
@@ -2803,6 +2820,13 @@ cal_status_poll_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data,
         fpi_ssm_next_state (transfer->ssm);
       break;
 
+    case SM_PRE_CAL_RESET_POLL_RESP:
+      if (transfer->buffer[5] == 0x00)
+        fpi_ssm_jump_to_state (transfer->ssm, SM_PRE_CAL_RESET_POLL_REQ);
+      else
+        fpi_ssm_next_state (transfer->ssm);
+      break;
+
     case SM_RESET_POLL_RESP:
       if (transfer->buffer[5] == 0x00)
         fpi_ssm_jump_to_state (transfer->ssm, SM_RESET_POLL_REQ);
@@ -3051,6 +3075,21 @@ ssm_run_state (FpiSsm *ssm, FpDevice *dev)
           self->cal_poll_iters = 0;
           fpi_ssm_next_state (ssm);
         }
+      break;
+
+    case SM_PRE_CAL_RESET:
+      start_cal_packet_array (self, ssm,
+                              EGIS0575_PRE_RESET_PACKETS,
+                              EGIS0575_PRE_RESET_PACKETS_LENGTH);
+      break;
+
+    case SM_PRE_CAL_RESET_POLL_REQ:
+      cal_send (ssm, dev, EGIS0575_RESET_POLL_PACKET.sequence, EGIS0575_RESET_POLL_PACKET.length,
+                fpi_ssm_usb_transfer_cb);
+      break;
+
+    case SM_PRE_CAL_RESET_POLL_RESP:
+      cal_read (ssm, dev, 7, cal_status_poll_cb);
       break;
 
     case SM_CAL_PHASE_1:
@@ -3476,8 +3515,15 @@ reset_action_state (FpDeviceEgis0575 *self)
   self->agc_meas_fresh = FALSE;
   self->weak_press_events = 0;
   self->weak_press_window_start = 0;
-  self->background_warmup_remaining = EGIS0575_BACKGROUND_WARMUP_FRAMES;
-  clear_background (self);
+  if (self->background)
+    {
+      self->background_warmup_remaining = 0;
+      self->capture_armed = TRUE;
+    }
+  else
+    {
+      self->background_warmup_remaining = EGIS0575_BACKGROUND_WARMUP_FRAMES;
+    }
 
   /* Cancel does not touch verify_probes (only dev_verify rebuilds the array
    * and finalize_verify drains it), so a cancelled verify leaves collected
@@ -3720,7 +3766,6 @@ wipe_verify_gallery (FpDeviceEgis0575 *self)
 static void
 egis0575_release_buffers (FpDeviceEgis0575 *self)
 {
-  clear_background (self);
   /* verify_probes elements are wiped by feature_set_free */
   g_clear_pointer (&self->verify_probes, g_ptr_array_unref);
   wipe_verify_gallery (self);
@@ -3950,6 +3995,7 @@ fpi_device_egis0575_dispose (GObject *object)
   FpDeviceEgis0575 *self = FPI_DEVICE_EGIS0575 (object);
 
   g_clear_pointer (&self->calibration, g_free);
+  clear_background (self);
   g_clear_pointer (&self->feedback_cache, g_ptr_array_unref);
   egis0575_release_buffers (self);
 

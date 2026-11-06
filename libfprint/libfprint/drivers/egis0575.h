@@ -282,11 +282,11 @@ static const Packet EGIS0575_POST_CALIBRATION_PACKETS[] = {
 #define EGIS0575_ENHANCE_STRETCH_OUT_LO 20
 #define EGIS0575_ENHANCE_STRETCH_OUT_HI 245
 #define EGIS0575_STAGE2_GRAIN_DIFF_THRESHOLD 25
-#define EGIS0575_STAGE2_GRAIN_PCT_X1000 6000
+#define EGIS0575_STAGE2_GRAIN_PCT_X1000 10000
 #define EGIS0575_STAGE2_MIN_MINUTIAE 0
-#define EGIS0575_STAGE2_MAX_MINUTIAE 10
+#define EGIS0575_STAGE2_MAX_MINUTIAE 35
 #define EGIS0575_STAGE2_RIDGE_PIXEL_THRESHOLD 180
-#define EGIS0575_STAGE2_MIN_RIDGE_PIXELS 4000
+#define EGIS0575_STAGE2_MIN_RIDGE_PIXELS 1800
 
 /*
  * Presence gate: coverage is the primary background-subtracted signal.
@@ -297,9 +297,9 @@ static const Packet EGIS0575_POST_CALIBRATION_PACKETS[] = {
  * heuristic in the sensor-health watchdog.  (EH577 for comparison:
  * no-finger <=173, finger-present >=1047.)
  */
-#define EGIS0575_PRESENCE_MIN_COVERAGE_PCT 18
+#define EGIS0575_PRESENCE_MIN_COVERAGE_PCT 12
 #define EGIS0575_PRESENCE_MIN_INTENSITY 10
-#define EGIS0575_PRESENCE_MIN_RAW_FINGER_PIXELS 800
+#define EGIS0575_PRESENCE_MIN_RAW_FINGER_PIXELS 600
 
 /* Weak-press degradation heuristic (sensor-health watchdog): a real press
  * pulls the raw finger-like count below this from the ~5356 idle baseline. */
